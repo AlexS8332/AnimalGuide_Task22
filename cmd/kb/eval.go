@@ -112,3 +112,28 @@ func writeFile(path string, data []byte) error {
 	}
 	return os.WriteFile(path, data, 0o644)
 }
+
+// writeAtomic пишет файл через временный рядом и переименование: прерванная
+// запись (Ctrl+C, сбой диска) не оставит набор вопросов обрезанным —
+// читатель видит либо старый файл, либо новый целиком.
+func writeAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	_, err = tmp.Write(data)
+	if err == nil {
+		err = tmp.Chmod(0o644)
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(name, path)
+	}
+	if err != nil {
+		os.Remove(name)
+	}
+	return err
+}

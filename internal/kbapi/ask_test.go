@@ -391,3 +391,80 @@ func TestEvalsKeep(t *testing.T) {
 		t.Fatalf("помнит %d, первый %s", len(list), list[0].ID)
 	}
 }
+
+// DELETE evals/{id} — отмена идущего прогона: контекст горутины отменён,
+// состояние сразу cancelled, строки — какие успели; новый прогон можно
+// запускать сразу.
+func TestEvalsCancel(t *testing.T) {
+	a, _ := askAPI(t)
+	started, stopped := make(chan struct{}), make(chan error, 1)
+	a.Eval = func(ctx context.Context, qs kb.QuestionSet, o rag.EvalOptions) (rag.Report, error) {
+		q := qs.Questions[0]
+		o.Progress(rag.Row{Question: q, Runs: map[rag.Mode][]rag.Run{rag.RAG: {{Repeat: 1}}}})
+		close(started)
+		<-ctx.Done()
+		stopped <- ctx.Err()
+		return rag.Report{}, ctx.Err()
+	}
+	srv := serve(t, a)
+	var v EvalView
+	if code := post(t, srv, "/api/kb/evals", EvalRequest{}, &v); code != http.StatusAccepted {
+		t.Fatalf("POST: %d", code)
+	}
+	<-started
+	var got EvalView
+	if code := do(t, srv, http.MethodDelete, "/api/kb/evals/"+v.ID, &got); code != http.StatusOK {
+		t.Fatalf("DELETE: %d", code)
+	}
+	if got.State != StateCancelled || got.Done != 1 || len(got.Rows) != 1 || !strings.Contains(got.Error, "остановлен") {
+		t.Fatalf("отменён: %+v", got)
+	}
+	select {
+	case err := <-stopped:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("контекст: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("контекст прогона не отменён")
+	}
+	// Итог горутины не перетирает cancelled.
+	time.Sleep(50 * time.Millisecond)
+	if after := waitEval(t, srv, v.ID, func(EvalView) bool { return true }); after.State != StateCancelled || len(after.Rows) != 1 {
+		t.Fatalf("после конца горутины: %+v", after)
+	}
+	if code := do(t, srv, http.MethodDelete, "/api/kb/evals/"+v.ID, nil); code != http.StatusConflict {
+		t.Fatalf("повторная отмена: %d", code)
+	}
+	if code := do(t, srv, http.MethodDelete, "/api/kb/evals/e9", nil); code != http.StatusNotFound {
+		t.Fatalf("нет прогона: %d", code)
+	}
+	if code := do(t, srv, http.MethodPut, "/api/kb/evals/"+v.ID, nil); code != http.StatusMethodNotAllowed {
+		t.Fatalf("PUT: %d", code)
+	}
+	a.Eval = func(ctx context.Context, qs kb.QuestionSet, o rag.EvalOptions) (rag.Report, error) {
+		return rag.Report{}, nil
+	}
+	if code := post(t, srv, "/api/kb/evals", EvalRequest{}, &v); code != http.StatusAccepted || v.ID != "e2" {
+		t.Fatalf("новый прогон после отмены: %d %+v", code, v)
+	}
+}
+
+// question_id с изменённым текстом — другой вопрос: ответы есть, оценки
+// правилом нет, причина — в note.
+func TestAskChangedQuestion(t *testing.T) {
+	a, _ := askAPI(t)
+	srv := serve(t, a)
+	var v AskView
+	if code := post(t, srv, "/api/kb/ask", AskRequest{Q: "Чем кормится корсак?", QuestionID: "T01"}, &v); code != http.StatusOK {
+		t.Fatalf("код %d", code)
+	}
+	if len(v.Answers) != 2 || v.Rows != nil || !strings.Contains(v.Note, "не совпадает с T01") {
+		t.Fatalf("изменённый вопрос: %+v", v)
+	}
+	// Пробелы не в счёт.
+	v = AskView{}
+	post(t, srv, "/api/kb/ask", AskRequest{Q: "  Чем кормится   манул? ", QuestionID: "T01"}, &v)
+	if len(v.Rows) != 2 || v.Note != "" {
+		t.Fatalf("тот же вопрос: %+v", v)
+	}
+}

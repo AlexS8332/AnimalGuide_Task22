@@ -90,7 +90,7 @@ func runProbe(ctx context.Context, args []string, out, errOut io.Writer) int {
 			fmt.Fprintln(errOut, "ошибка:", err)
 			return exitFailed
 		}
-		if err := os.WriteFile(*questions, updated, 0o644); err != nil {
+		if err := writeAtomic(*questions, updated); err != nil {
 			fmt.Fprintln(errOut, "ошибка:", err)
 			return exitFailed
 		}

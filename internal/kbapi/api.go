@@ -56,8 +56,11 @@ func (a *API) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	case strings.HasPrefix(path, "evals/"):
-		if method(w, r, http.MethodGet) {
-			a.getEval(w, strings.TrimPrefix(path, "evals/"))
+		id := strings.TrimPrefix(path, "evals/")
+		if r.Method == http.MethodDelete {
+			a.cancelEval(w, id)
+		} else if method(w, r, http.MethodGet, http.MethodDelete) {
+			a.getEval(w, id)
 		}
 		return
 	}

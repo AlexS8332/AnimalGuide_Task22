@@ -54,6 +54,7 @@ const kb = {
   eval: null,           // EvalView открытого прогона
   evalError: null,      // {code, text, id, why, hint} — ошибка запуска или опроса
   starting: false,
+  stopping: false,      // идёт DELETE прогона
   qaOpen: {},           // id вопроса → раскрыта строка
   pollMs: 700,
   timer: null,
@@ -224,6 +225,8 @@ function kbPaint(...parts) {
   if (ask) { ask.disabled = kb.asking; ask.innerHTML = kb.asking ? '<span class="thinking">думает</span>' : 'Спросить'; }
   const run = $('kb-qa-run');
   if (run) run.disabled = kbQaRunning() || kb.starting;
+  const stop = $('kb-qa-stop');
+  if (stop) stop.hidden = !kbQaRunning() || kb.stopping;
 }
 
 // kbOffHTML — базы нет (503) или сервер не знает /api/kb.
@@ -697,6 +700,7 @@ function kbAskOutHTML() {
   const q = kbQuestion(r.qid);
   return `<div id="kb-ask-out" class="kb-ask-out" data-q="${esc(d.q)}" data-qid="${esc(r.qid || '')}">
     ${kbExpectHTML(q, 'kb-ask-expect')}
+    ${d.note ? `<div class="hint kb-ask-note" id="kb-ask-note">${esc(d.note)}</div>` : ''}
     <div class="kb-answers" id="kb-answers" style="--kb-cols:${Math.max(1, Math.min(answers.length, 2))}">${answers.map(a =>
       kbAnswerHTML(a, runs.find(x => x.answer && x.answer.mode === a.mode), q, errFor(a.mode))).join('')}</div>
     ${kbPromptHTML(answers)}
@@ -819,6 +823,7 @@ function kbQaHTML() {
       <select id="kb-qa-repeats">${[1, 2, 3].map(n => `<option value="${n}"${n === f.repeats ? ' selected' : ''}>${n}</option>`).join('')}</select>
       <label class="kb-check" title="второй голос: судья-модель видит вопрос, ожидание и один ответ без пометки режима"><input type="checkbox" id="kb-qa-judge"${f.judge ? ' checked' : ''}> судья-модель</label>
       <button type="submit" class="solid" id="kb-qa-run"${kbQaRunning() || kb.starting ? ' disabled' : ''}>Прогнать набор test</button>
+      <button type="button" id="kb-qa-stop" data-action="kbQaStop"${kbQaRunning() && !kb.stopping ? '' : ' hidden'}>Остановить</button>
       <span class="hint">Платно: 10 вопросов × 2 режима × повторы; судья — ещё запрос на каждый ответ.</span>
     </form>
     ${kbQaLiveHTML()}
@@ -858,7 +863,8 @@ function kbQaLiveHTML() {
     const pct = v.total ? Math.round(100 * (v.done || 0) / v.total) : 0;
     const req = v.request || {};
     const state = v.state === 'running' ? '<span class="thinking">идёт</span>'
-      : v.state === 'done' ? '<span class="chip ok">готово</span>' : '<span class="chip bad">сбой</span>';
+      : v.state === 'done' ? '<span class="chip ok">готово</span>'
+      : v.state === 'cancelled' ? '<span class="chip">остановлен</span>' : '<span class="chip bad">сбой</span>';
     html += `<div class="kb-qa-status" id="kb-qa-status" data-run="${esc(v.id)}" data-state="${esc(v.state)}">
       <b>Прогон ${esc(v.id)}</b> ${state}
       <span id="kb-qa-count">${esc(v.done || 0)} из ${esc(v.total || 0)} ответов</span>
@@ -1002,7 +1008,7 @@ function kbQaRunsHTML() {
     const by = m => st.find(s => s.mode === m);
     const score = st.length ? kbModes.filter(by).map(m => `${kbModeTitle[m]} ${by(m).correct}/${by(m).questions}`).join(' · ') : '';
     const cost = st.length ? kbCost(st.reduce((c, s) => ({ usd: c.usd + ((s.cost || {}).usd || 0), known: c.known && (s.cost || {}).known }), { usd: 0, known: true })) : '';
-    const state = x.state === 'running' ? 'идёт' : x.state === 'done' ? 'готово' : 'сбой';
+    const state = x.state === 'running' ? 'идёт' : x.state === 'done' ? 'готово' : x.state === 'cancelled' ? 'остановлен' : 'сбой';
     return `<button type="button" class="kb-qa-run${x.id === cur ? ' on' : ''}" data-run="${esc(x.id)}" data-state="${esc(x.state)}" data-action="kbQaOpen" data-arg="${esc(x.id)}">
       <b>${esc(x.id)}</b> <span>${esc(kbTime(x.started))}</span> <span class="chip${x.state === 'done' ? ' ok' : x.state === 'failed' ? ' bad' : ''}">${esc(state)}</span>
       <span class="hint">×${esc((x.request || {}).repeats || 1)}${(x.request || {}).judge ? ', судья' : ''}</span>${score ? ` <span>${esc(score)}</span>` : ''}${cost ? ` <span class="hint">${esc(cost)}</span>` : ''}</button>`;
@@ -1067,7 +1073,9 @@ async function kbQaPoll() {
   }
   if (kb.watching && !$('kb-qa') && r.ok) {
     const st = kbList(kb.eval.report && kb.eval.report.stats).find(s => s.mode === 'rag');
-    toast('Контрольные вопросы: ' + (kb.eval.state === 'done' ? 'прогон готов' + (st ? `, с базой верно ${st.correct} из ${st.questions}` : '') : 'сбой — подробности в окне «База знаний»'), kb.eval.state !== 'done');
+    const what = kb.eval.state === 'done' ? 'прогон готов' + (st ? `, с базой верно ${st.correct} из ${st.questions}` : '')
+      : kb.eval.state === 'cancelled' ? 'прогон остановлен' : 'сбой — подробности в окне «База знаний»';
+    toast('Контрольные вопросы: ' + what, kb.eval.state === 'failed');
   }
   kb.watching = false;
 }
@@ -1084,6 +1092,19 @@ Object.assign(actions, {
     if ($('kb-ask-context')) $('kb-ask-context').outerHTML = kbAskContextHTML();
   },
   kbQaRun() { kbQaRun(); },
+  // kbQaStop — DELETE прогона: сервер отменяет его контекст и сразу
+  // отвечает состоянием cancelled со строками, что успели.
+  async kbQaStop() {
+    const id = kb.eval && kb.eval.id;
+    if (!id || !kbQaRunning() || kb.stopping) return;
+    kb.stopping = true;
+    kbPaint();
+    const r = await factsAPI('DELETE', '/api/kb/evals/' + encodeURIComponent(id));
+    kb.stopping = false;
+    if (!r.ok && r.code !== 409) { toast('Остановить не вышло: ' + r.error, true); kbPaint(); return; }
+    if (r.ok && kb.eval && kb.eval.id === id) kb.eval = r.data;
+    kbQaPoll();
+  },
   kbQaToggle(id) {
     if (!id) return;
     kb.qaOpen[id] = !kb.qaOpen[id];

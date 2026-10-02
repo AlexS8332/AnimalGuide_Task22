@@ -211,6 +211,10 @@ func TestProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Запись атомарная: временного файла рядом не осталось.
+	if left, _ := filepath.Glob(filepath.Join(dir, ".questions.json.*")); len(left) != 0 {
+		t.Fatalf("временные файлы: %v", left)
+	}
 	for _, q := range qs.Questions {
 		switch {
 		case !q.Answerable || q.Split == kb.SplitOut:
