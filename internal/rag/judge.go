@@ -108,16 +108,19 @@ var sourceWords = regexp.MustCompile(`(?i)(в|во) (?:базе знаний|ф�
 
 // Blind — ответ для судьи без примет режима: ссылки [chunk_id] вырезаны
 // (и голые «manul/structure/004» тоже), «в базе знаний» и «во фрагментах»
-// заменены на «в источниках». Правило оценивает исходный ответ: ссылки
-// оно и так не считает числами.
+// заменены на «у меня» — так говорит о незнании и модель без базы. Не «в
+// источниках»: судья видит доказательства, и «в источниках этого нет» читал
+// как утверждение, противоречащее им, — честный отказ становился wrong
+// (прогон И-10 2026-10-02, T03 и T06). Правило оценивает исходный ответ:
+// ссылки оно и так не считает числами.
 func Blind(answer string) string {
 	s := refBlock.ReplaceAllString(answer, "")
 	s = chunkRef.ReplaceAllString(s, "")
 	s = sourceWords.ReplaceAllStringFunc(s, func(m string) string {
 		if strings.HasPrefix(m, "В") {
-			return "В источниках"
+			return "У меня"
 		}
-		return "в источниках"
+		return "у меня"
 	})
 	return strings.TrimSpace(s)
 }
