@@ -15,15 +15,18 @@ import (
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/agents/agentstest"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/collection"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/compiler"
+	"github.com/AlexS8332/AnimalGuide_Task22/internal/embed"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/extract"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/features"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/history"
+	"github.com/AlexS8332/AnimalGuide_Task22/internal/kb"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/llm"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/llm/llmtest"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/mcp"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/memory"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/persona"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/profile"
+	"github.com/AlexS8332/AnimalGuide_Task22/internal/rag"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/runs"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/store"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/tokens"
@@ -122,8 +125,19 @@ func (r *rig) open(dir string, o Options) (Build, error) {
 	people := &persona.Hook{Memory: memory.NewStore(d), Profiles: profile.NewStore(d),
 		Extractor: extract.Extractor{LLM: r.fake, Model: llm.DefaultModel}}
 	compile := &compiler.Hook{Agents: deps, Store: collection.NewStore(d)}
+	hooks := []runs.Hook{compile, people, &charterDir{h: r.charter, dir: dir}}
+	// База знаний — как у приложения: стенд задаёт путь (И-10), хук rag
+	// ищет по ней hash-эмбеддером, которым база собрана в тесте.
+	if o.KB != "" {
+		st, err := kb.Open(context.Background(), o.KB)
+		if err != nil {
+			return Build{}, err
+		}
+		r.t.Cleanup(func() { st.Close() })
+		hooks = append(hooks, &rag.Hook{Searcher: &kb.Searcher{Store: st, Embedder: embed.Hash{}}})
+	}
 	m := runs.NewManager(runs.Config{Agents: deps, Store: history.NewStore(d), Registry: reg, Defaults: reg.Defaults(),
-		Timeout: time.Minute, Hooks: []runs.Hook{compile, people, &charterDir{h: r.charter, dir: dir}}})
+		Timeout: time.Minute, Hooks: hooks})
 	b := Build{Manager: m, HTTP: fetcher.Requests}
 	if !r.noMCP {
 		b.MCP = rigClient{Client: client, srv: srv}
@@ -393,20 +407,20 @@ func TestSlugs(t *testing.T) {
 
 func TestSelect(t *testing.T) {
 	all := Trials()
-	if len(all) != 9 {
+	if len(all) != 10 {
 		t.Fatalf("испытаний %d", len(all))
 	}
 	got, err := Select(all, "И-1, 6,i6")
 	if err != nil || len(got) != 2 || got[0].ID() != "И-1" || got[1].ID() != "И-6" {
 		t.Fatalf("выбор: %v", err)
 	}
-	if got, _ := Select(all, "all"); len(got) != 9 {
+	if got, _ := Select(all, "all"); len(got) != 10 {
 		t.Fatal("all")
 	}
-	if got, _ := Select(all, ""); len(got) != 9 {
+	if got, _ := Select(all, ""); len(got) != 10 {
 		t.Fatal("пусто — все")
 	}
-	if _, err := Select(all, "И-10"); err == nil {
+	if _, err := Select(all, "И-11"); err == nil {
 		t.Fatal("неизвестное испытание")
 	}
 	if _, err := Select(all, " , "); err == nil {
