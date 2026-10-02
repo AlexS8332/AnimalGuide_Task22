@@ -297,6 +297,8 @@ func TestEdge(t *testing.T) {
 		{"hub", a.main},
 		{"kb", a.main},
 		{"kb-none", a.main},
+		{"kb-ask", a.main},
+		{"kb-qa", a.main},
 	}
 	total := 0
 	for _, sc := range scenarios {
@@ -359,6 +361,9 @@ func TestEdge(t *testing.T) {
 			{"kb-search.png", "shot-kb-search", a.main},
 			{"kb-report.png", "shot-kb-report", a.main},
 			{"kb-none.png", "shot-kb-none", a.main},
+			{"kb-ask.png", "shot-kb-ask", a.main},
+			{"kb-qa.png", "shot-kb-qa", a.main},
+			{"kb-qa-summary.png", "shot-kb-qa-summary", a.main},
 		} {
 			edgeRun(t, edge, fmt.Sprintf("%s/?scenario=%s#c=%s", shot.URL, s.scenario, s.conv), "1400,900",
 				"--screenshot="+filepath.Join(abs, s.file))

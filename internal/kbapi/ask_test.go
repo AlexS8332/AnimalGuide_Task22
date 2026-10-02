@@ -225,7 +225,9 @@ func TestQuestions(t *testing.T) {
 		t.Fatalf("%d %+v", code, qs)
 	}
 	a.Questions = filepath.Join(t.TempDir(), "нет.json")
-	a.Eval = func(ctx context.Context, qs kb.QuestionSet, o rag.EvalOptions) (rag.Report, error) { return rag.Report{}, nil }
+	a.Eval = func(ctx context.Context, qs kb.QuestionSet, o rag.EvalOptions) (rag.Report, error) {
+		return rag.Report{}, nil
+	}
 	var e map[string]string
 	if code := get(t, srv, "/api/kb/questions", &e); code != http.StatusNotFound || !strings.Contains(e["error"], "нет.json") || e["hint"] == "" {
 		t.Fatalf("нет файла: %d %v", code, e)
