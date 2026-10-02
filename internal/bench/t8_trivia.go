@@ -164,9 +164,13 @@ func (t *Trivia) Run(ctx context.Context, s *Stand, r *Result) error {
 	r.Lanes = append(r.Lanes, LaneInfo{Name: laneDaemon, Note: "animals-mcp -daemon над своим каталогом, настоящие источники и модель, подставные часы",
 		Diff: "не диалог: выпуски по расписанию"})
 
-	// Часы — от настоящего «сейчас»: выбор вида и выпуски пишут время
-	// подставных часов, а цена считается по тарифу этого же момента.
-	g := &trivRig{env: s.env, dir: dir, clock: clocktest.NewFake(time.Now().UTC().Truncate(time.Minute)),
+	// Часы — сегодня в 10:00 UTC, а не настоящее «сейчас». Сценарий
+	// проходит на подставных часах около девяти часов: начатый вечером, он
+	// переходил полночь, суточный лимит обнулялся, и проверки лимита
+	// проваливались в зависимости от времени запуска. С 10:00 до 19:00 нет ни
+	// полуночи, ни плановых заданий (mdd в 04:00, сводка в 09:00). Цена
+	// считается по тарифу этого подставного момента.
+	g := &trivRig{env: s.env, dir: dir, clock: clocktest.NewFake(trivStart(time.Now())),
 		budget: 1, events: make(chan schedule.Run, 64)}
 	defer g.stop()
 	began := g.clock.Now()
@@ -454,4 +458,10 @@ func trivCopy(src, dst string) error {
 		}
 	}
 	return nil
+}
+
+// trivStart — начало подставных часов И-8: сегодня (UTC) в 10:00.
+func trivStart(now time.Time) time.Time {
+	y, m, d := now.UTC().Date()
+	return time.Date(y, m, d, 10, 0, 0, 0, time.UTC)
 }
