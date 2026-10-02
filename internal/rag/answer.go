@@ -46,6 +46,23 @@ func (q Question) Query() string {
 	return strings.Join(append(parts, strings.TrimSpace(q.Text)), " ")
 }
 
+// UserText — сообщение пользователя без фрагментов. Без контекста — сам
+// вопрос; с контекстом — «Предыдущие реплики пользователя:» списком, пустая
+// строка и «Вопрос: …».
+func (q Question) UserText() string {
+	text := strings.TrimSpace(q.Text)
+	var prev []string
+	for _, c := range q.Context {
+		if c = strings.TrimSpace(c); c != "" {
+			prev = append(prev, "- "+c)
+		}
+	}
+	if len(prev) == 0 {
+		return text
+	}
+	return "Предыдущие реплики пользователя:\n" + strings.Join(prev, "\n") + "\n\nВопрос: " + text
+}
+
 // QuestionOf — вопрос набора для отвечающего агента.
 func QuestionOf(q kb.Question) Question {
 	return Question{Text: q.Q, Context: q.Context}
@@ -54,11 +71,12 @@ func QuestionOf(q kb.Question) Question {
 // Answer отвечает в режиме. RAG без базы (Searcher == nil) — ошибка, а не
 // тихий NoRAG.
 //
-// Один запрос к модели, без инструментов, температура 0. Контекст вопроса
-// (предыдущие реплики человека) идёт отдельными сообщениями пользователя
-// перед вопросом — так их видит и ведущий в чате; ответов справочника на
-// них у отвечающего агента нет, поэтому истории ассистента нет. Фрагменты
-// базы — в том же сообщении, что вопрос, после него.
+// Один запрос к модели, без инструментов, температура 0: системный промпт
+// и ОДНО сообщение пользователя. Контекст вопроса (предыдущие реплики
+// человека) — в том же сообщении перед вопросом (UserText): ответов
+// справочника на них у отвечающего агента нет, а несколько сообщений
+// пользователя подряд без ответов между ними модель читает как
+// оборванный диалог. Фрагменты базы — в том же сообщении, после вопроса.
 func (a *Answerer) Answer(ctx context.Context, q Question, mode Mode) (Answer, error) {
 	if strings.TrimSpace(q.Text) == "" {
 		return Answer{}, errors.New("пустой вопрос")
@@ -69,7 +87,7 @@ func (a *Answerer) Answer(ctx context.Context, q Question, mode Mode) (Answer, e
 	if a == nil || a.LLM == nil {
 		return Answer{}, errors.New("отвечающему агенту не передана модель")
 	}
-	out := Answer{Mode: mode, System: System(mode), User: strings.TrimSpace(q.Text)}
+	out := Answer{Mode: mode, System: System(mode), User: q.UserText()}
 	if mode == RAG {
 		if a.Searcher == nil {
 			return Answer{}, errors.New("режим rag без базы знаний: соберите её командой kb index")
@@ -81,13 +99,7 @@ func (a *Answerer) Answer(ctx context.Context, q Question, mode Mode) (Answer, e
 		out.Hits, out.Search = hits, info
 		out.User += "\n\n" + Compose(hits)
 	}
-	msgs := []llm.Message{{Role: llm.RoleSystem, Content: out.System}}
-	for _, c := range q.Context {
-		if c = strings.TrimSpace(c); c != "" {
-			msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: c})
-		}
-	}
-	msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: out.User})
+	msgs := []llm.Message{{Role: llm.RoleSystem, Content: out.System}, {Role: llm.RoleUser, Content: out.User}}
 
 	started := time.Now()
 	resp, err := a.LLM.Chat(ctx, llm.Request{Model: a.model(), Messages: msgs, Temperature: 0})

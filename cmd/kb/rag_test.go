@@ -51,7 +51,7 @@ func (f *fakeDeepSeek) serve(t *testing.T) {
 		switch {
 		case sys == rag.JudgeSystem():
 			text = `{"verdict":"abstain","reason":"сказано, что не знает"}`
-			if strings.Contains(user, "ВЕРНО") || strings.Contains(user, "/structure/") {
+			if strings.Contains(user, "ВЕРНО") || strings.Contains(user, "По базе: ответ.") {
 				text = "```json\n{\"verdict\":\"correct\",\"reason\":\"совпало\"}\n```"
 			}
 		case sys == rag.System(rag.RAG):
@@ -106,9 +106,9 @@ func TestAsk(t *testing.T) {
 	if strings.Contains(out, " 4. ") || f.count() != 2 {
 		t.Fatalf("k или число запросов: %d\n%s", f.count(), out)
 	}
-	// Предыдущая реплика — отдельным сообщением перед вопросом.
+	// Предыдущая реплика — в том же сообщении перед вопросом.
 	rq := f.reqs[1]
-	if len(rq.Messages) != 3 || rq.Messages[1].Content != "Где в России водится харза?" || rq.Model != llm.DefaultModel {
+	if len(rq.Messages) != 2 || !strings.HasPrefix(rq.Messages[1].Content, "Предыдущие реплики пользователя:\n- Где в России водится харза?\n\nВопрос: А сколько она весит?") || rq.Model != llm.DefaultModel {
 		t.Fatalf("запрос rag: %+v", rq.Messages)
 	}
 	// norag без базы: kb.db не нужна.

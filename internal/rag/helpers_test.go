@@ -124,10 +124,19 @@ func verdictJSON(v Verdict, reason string) llm.Response {
 	return llmtest.Text(fmt.Sprintf(`{"verdict":%q,"reason":%q}`, v, reason))
 }
 
-// questionOf — вопрос набора по тексту реплики отвечающего агента: первая
-// строка user-сообщения (фрагменты идут после пустой строки).
+// askedText — текст вопроса в user-сообщении отвечающего агента: после
+// «Вопрос: », если есть контекст, и до пустой строки (за ней фрагменты).
+func askedText(user string) string {
+	if _, after, ok := strings.Cut(user, "\n\nВопрос: "); ok && strings.HasPrefix(user, "Предыдущие реплики пользователя:") {
+		user = after
+	}
+	text, _, _ := strings.Cut(user, "\n\n")
+	return text
+}
+
+// questionOf — вопрос набора по тексту реплики отвечающего агента.
 func questionOf(qs kb.QuestionSet, req llm.Request) (kb.Question, bool) {
-	text, _, _ := strings.Cut(lastUser(req), "\n\n")
+	text := askedText(lastUser(req))
 	for _, q := range qs.Questions {
 		if q.Q == text {
 			return q, true

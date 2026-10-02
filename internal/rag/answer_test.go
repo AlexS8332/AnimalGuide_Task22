@@ -130,8 +130,8 @@ func TestAnswerModes(t *testing.T) {
 	}
 }
 
-// Вопрос-продолжение: предыдущая реплика — отдельным сообщением перед
-// вопросом, а в поиск — вместе с вопросом.
+// Вопрос-продолжение: предыдущая реплика — в том же сообщении перед
+// вопросом (одно сообщение пользователя), а в поиск — вместе с вопросом.
 func TestAnswerContext(t *testing.T) {
 	fake := &llmtest.Fake{Fn: func(req llm.Request) (llm.Response, error) { return llmtest.Text("2,5–5,8 кг."), nil }}
 	// BM25: по слову «харза» из предыдущей реплики, без которой искать нечем.
@@ -145,9 +145,25 @@ func TestAnswerContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := fake.Requests[0].Messages
-	if len(m) != 3 || m[1].Role != llm.RoleUser || m[1].Content != "Где в России водится харза?" ||
-		!strings.HasPrefix(m[2].Content, "А сколько она весит?\n\n") || fake.Requests[0].Model != "m" {
+	want := "Предыдущие реплики пользователя:\n- Где в России водится харза?\n\nВопрос: А сколько она весит?\n\nФрагменты базы знаний"
+	if len(m) != 2 || m[0].Role != llm.RoleSystem || m[1].Role != llm.RoleUser || !strings.HasPrefix(m[1].Content, want) ||
+		ans.User != m[1].Content || fake.Requests[0].Model != "m" {
 		t.Fatalf("сообщения: %+v", m)
+	}
+	if askedText(m[1].Content) != q.Text {
+		t.Fatalf("вопрос в сообщении: %q", askedText(m[1].Content))
+	}
+	// norag: то же одно сообщение без фрагментов; без контекста — сам вопрос.
+	no, err := a.Answer(context.Background(), q, NoRAG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := fake.Requests[1].Messages; len(m) != 2 || no.User != m[1].Content ||
+		m[1].Content != "Предыдущие реплики пользователя:\n- Где в России водится харза?\n\nВопрос: А сколько она весит?" {
+		t.Fatalf("norag: %+v", m)
+	}
+	if (Question{Text: " Вопрос? ", Context: []string{" ", ""}}).UserText() != "Вопрос?" {
+		t.Fatal("пустой контекст")
 	}
 	found := false
 	for _, h := range ans.Hits {

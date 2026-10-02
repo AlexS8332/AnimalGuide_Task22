@@ -69,6 +69,11 @@ func (m *ragModel) chat(req llm.Request) (llm.Response, error) {
 		if sys == rag.System(rag.RAG) {
 			mode = rag.RAG
 		}
+		// Вопрос — после «Вопрос: », если перед ним реплики, и до
+		// фрагментов (после пустой строки).
+		if _, after, ok := strings.Cut(user, "\n\nВопрос: "); ok && strings.HasPrefix(user, "Предыдущие реплики пользователя:") {
+			user = after
+		}
 		text, _, _ := strings.Cut(user, "\n\n")
 		for _, q := range m.qs.Questions {
 			if q.Q == text {
