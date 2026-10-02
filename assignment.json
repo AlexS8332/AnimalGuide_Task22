@@ -3,7 +3,7 @@
   "slug": "animal-guide-rag",
   "title": "AnimalGuide: RAG-агент — ответ с базой знаний и без, 10 контрольных вопросов (DeepSeek, Go + браузер)",
   "stack": "go",
-  "status": "planned",
+  "status": "done",
   "created": "2026-10-02",
   "updated": "2026-10-02",
   "repo": "",
