@@ -25,7 +25,9 @@
 package kbapi
 
 import (
+	"context"
 	"net/http"
+	"sync"
 
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/corpus"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/embed"
@@ -55,7 +57,30 @@ type API struct {
 	Judge *rag.Judge
 	// Questions — путь к eval/questions.json.
 	Questions string
+
+	// Ask, Rule, Eval — чем отвечать и оценивать; nil — rag по умолчанию
+	// (Answerer.Answer, rag.Rule, rag.Eval). Подменяются в тестах и на
+	// стенде проверок интерфейса, где модели нет. Ask != nil включает ask и
+	// evals и без Answerer.
+	Ask  AskFunc
+	Rule RuleFunc
+	Eval EvalFunc
+
+	// mu охраняет прогоны evals: Progress приходит из горутины прогона,
+	// GET — из обработчиков.
+	mu    sync.Mutex
+	seq   int
+	evals []*evalRun // старые первыми
 }
+
+// AskFunc — ответ одного режима (как Answerer.Answer).
+type AskFunc func(ctx context.Context, q rag.Question, mode rag.Mode) (rag.Answer, error)
+
+// RuleFunc — оценка ответа правилом (как rag.Rule).
+type RuleFunc func(q kb.Question, answer string) rag.RuleResult
+
+// EvalFunc — прогон контрольных вопросов (как rag.Eval над Answerer).
+type EvalFunc func(ctx context.Context, qs kb.QuestionSet, o rag.EvalOptions) (rag.Report, error)
 
 // InfoView — GET info.
 type InfoView struct {

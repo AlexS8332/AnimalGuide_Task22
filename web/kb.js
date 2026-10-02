@@ -1,7 +1,8 @@
 'use strict';
 
-/* Окно «База знаний» (v21): корпус, чанки документа в двух стратегиях,
-   поиск по двум индексам рядом и последний отчёт сравнения стратегий.
+/* Окно «База знаний» (v21–v22): корпус, чанки документа в двух
+   стратегиях, поиск по двум индексам рядом, ответ модели с базой и без
+   неё, прогон контрольных вопросов и последний отчёт сравнения стратегий.
    Подключается после app.js и пользуется его общими помощниками (app, esc,
    actions, factsAPI, factsURL, num, plural, toast).
 
@@ -14,15 +15,25 @@
    попаданию ведёт к чанку. «Сравнение» — таблицы последнего отчёта
    `kb eval` и вывод числами.
 
+   v22: «Спросить» — один вопрос в режимах norag и rag, ответы рядом;
+   у rag — найденные фрагменты, ссылки [chunk_id] в ответе ведут к чанку;
+   вопрос из набора оценивается правилом. «Контрольные вопросы» — прогон
+   набора test в обоих режимах: строки заполняются по мере готовности
+   (опрос /api/kb/evals/{id}), итог — сводка режимов рядом и вывод.
+
    Всё, что пришло из корпуса (заголовки, тексты, разделы, причины), —
    данные, а не разметка: только через esc(). Стабильные id и классы
    (#kb-button, [data-kb-tab], #kb-docs, .kb-doc[data-doc], #kb-chunks,
    #kb-doc, #kb-strategy, .kb-chunk[data-id], #kb-search, #kb-q, #kb-k,
    #kb-mode, #kb-go, .kb-result[data-index], .kb-hit[data-chunk],
-   #kb-report, #kb-off) — для сценариев проверок и записи. */
+   #kb-report, #kb-off; v22: #kb-ask, #kb-ask-q, #kb-ask-pick, #kb-ask-go,
+   .kb-thinking, .kb-answer[data-mode], .kb-src[data-chunk], .kb-cite,
+   .kb-verdict[data-mode][data-verdict], #kb-ask-prompt, #kb-qa,
+   #kb-qa-run, .kb-qa-row[data-id], #kb-qa-summary, #kb-qa-runs) — для
+   сценариев проверок и записи. Ответы модели — тоже данные: esc(). */
 
 const kb = {
-  tab: 'docs',          // docs | chunks | search | report
+  tab: 'docs',          // docs | chunks | search | ask | qa | report
   info: null,           // {ok, code, data, error} — GET /api/kb/info
   docs: null,           // {ok, code, data, error} — GET /api/kb/docs
   doc: '',              // документ вкладки «Чанки»
@@ -33,6 +44,20 @@ const kb = {
   result: null,         // {ok, code, data, error} — GET /api/kb/search
   searching: false,
   report: null,         // {ok, code, data, error} — GET /api/kb/report
+  // v22
+  questions: null,      // {ok, code, data, error} — GET /api/kb/questions
+  askForm: { q: '', qid: '' },
+  ask: null,            // {ok, code, data, error} — POST /api/kb/ask
+  asking: false,
+  qaForm: { repeats: 1, judge: true },
+  evals: null,          // {ok, code, data, error} — GET /api/kb/evals
+  eval: null,           // EvalView открытого прогона
+  evalError: null,      // {code, text, id, why, hint} — ошибка запуска или опроса
+  starting: false,
+  qaOpen: {},           // id вопроса → раскрыта строка
+  pollMs: 700,
+  timer: null,
+  seq: 0,
 };
 app.kb = kb;
 
@@ -40,6 +65,8 @@ const kbTabs = [
   ['docs', 'Корпус', 'документы корпуса, индексы и эмбеддер'],
   ['chunks', 'Чанки', 'текст документа и границы чанков в двух стратегиях'],
   ['search', 'Поиск', 'один запрос в оба индекса — выдачи рядом'],
+  ['ask', 'Спросить', 'ответ модели без базы и с базой — рядом'],
+  ['qa', 'Контрольные вопросы', 'прогон набора test в обоих режимах и сравнение'],
   ['report', 'Сравнение', 'последний отчёт сравнения стратегий (kb eval)'],
 ];
 const kbStrategyText = { structure: 'structure — по разделам', fixed: 'fixed — окно с перекрытием' };
@@ -158,6 +185,8 @@ async function kbLoadTab() {
   if (!kbBase()) return;
   if (kb.tab === 'chunks') await kbLoadDoc(kb.doc);
   if (kb.tab === 'report' && (!kb.report || !kb.report.ok)) await kbLoadReport();
+  if (kb.tab === 'ask' || kb.tab === 'qa') await kbLoadQuestions();
+  if (kb.tab === 'qa') await kbLoadEvals(true);
 }
 
 function kbTabsHTML() {
@@ -175,6 +204,8 @@ function kbBodyHTML() {
     case 'chunks': return kbChunksHTML();
     case 'search': return kbSearchHTML();
     case 'report': return kbReportHTML();
+    case 'ask': return kbAskHTML();
+    case 'qa': return kbQaHTML();
     default: return kbDocsHTML();
   }
 }
@@ -184,8 +215,15 @@ function kbPaint(...parts) {
   if (parts.includes('tabs')) $('kb-tabs').innerHTML = kbTabsHTML();
   if (parts.includes('body')) $('kb-body').innerHTML = kbBodyHTML();
   if (parts.includes('results') && $('kb-results')) $('kb-results').outerHTML = kbResultsHTML();
+  if (parts.includes('ask') && $('kb-ask-out')) $('kb-ask-out').outerHTML = kbAskOutHTML();
+  if (parts.includes('qa') && $('kb-qa-live')) $('kb-qa-live').outerHTML = kbQaLiveHTML();
+  if (parts.includes('runs') && $('kb-qa-runs')) $('kb-qa-runs').outerHTML = kbQaRunsHTML();
   const go = $('kb-go');
   if (go) { go.disabled = kb.searching; go.innerHTML = kb.searching ? '<span class="thinking">ищу</span>' : 'Найти'; }
+  const ask = $('kb-ask-go');
+  if (ask) { ask.disabled = kb.asking; ask.innerHTML = kb.asking ? '<span class="thinking">думает</span>' : 'Спросить'; }
+  const run = $('kb-qa-run');
+  if (run) run.disabled = kbQaRunning() || kb.starting;
 }
 
 // kbOffHTML — базы нет (503) или сервер не знает /api/kb.
@@ -511,12 +549,565 @@ function kbQuestionsHTML(ret) {
     }).join('')}</tr>`).join('')}</table></details>`;
 }
 
+/* ---------- v22: общее для «Спросить» и «Контрольных вопросов» ---------- */
+
+const kbModes = ['norag', 'rag'];
+const kbModeTitle = { norag: 'Без базы', rag: 'С базой (RAG)' };
+const kbModeHint = {
+  norag: 'модель отвечает по памяти: системный промпт и вопрос',
+  rag: 'тот же системный промпт и вопрос плюс найденные фрагменты базы',
+};
+// Значок и слово вердикта; у «не знаю» значок — сами слова.
+const kbVerdicts = {
+  correct: ['✓', 'верно'],
+  partial: ['½', 'частично'],
+  wrong: ['✗', 'неверно'],
+  abstain: ['не знаю', 'не знаю'],
+};
+const kbSplitTitle = { test: 'test — контрольные', dev: 'dev — подбор', out: 'out — вне базы' };
+// chunk_id — «doc/strategy/ord»: «manul/structure/004».
+const kbChunkRe = /^[a-z0-9][a-z0-9_.-]*\/[a-z0-9_-]+\/\d{3}$/i;
+
+function kbQuestionList() { return kb.questions && kb.questions.ok ? kbList(kb.questions.data) : []; }
+function kbQuestion(id) { return id ? kbQuestionList().find(q => q.id === id) || null : null; }
+function kbCost(c) {
+  if (!c || typeof c.usd !== 'number') return '—';
+  return (c.known ? '' : '≈') + factsUSD(c.usd);
+}
+function kbMs(ms) { return typeof ms === 'number' && ms > 0 ? (ms >= 1000 ? (ms / 1000).toFixed(1) + ' с' : ms + ' мс') : '—'; }
+function kbSources(q) {
+  return kbList(q && q.sources).map(s => s.doc_id + (s.section ? ' › ' + s.section : '')).join('; ');
+}
+
+async function kbLoadQuestions() {
+  if (kb.questions && kb.questions.ok) return;
+  kb.questions = await factsAPI('GET', '/api/kb/questions');
+}
+
+// kbVerdictHTML — вердикт режима; long — со словом. Пусто — ответа ещё нет.
+function kbVerdictHTML(mode, v, title, long) {
+  if (!v) return `<span class="kb-verdict pending" data-mode="${esc(mode)}" data-verdict="" title="ответа ещё нет">…</span>`;
+  const [icon, label] = kbVerdicts[v] || ['?', v];
+  const word = long && v !== 'abstain' ? ` <span class="kb-verdict-l">${esc(label)}</span>` : '';
+  return `<span class="kb-verdict ${esc(v)}" data-mode="${esc(mode)}" data-verdict="${esc(v)}" title="${esc(title || label)}">${esc(icon)}${word}</span>`;
+}
+
+// kbAnswerTextHTML — ответ модели как данные: esc(), переносы строк — CSS
+// (pre-wrap); ссылки [chunk_id] (и [a, b]) — кнопки к чанку. Ссылка на
+// фрагмент, которого не было в выдаче, помечена: модель могла её выдумать.
+function kbAnswerTextHTML(text, hits) {
+  const known = new Set(kbList(hits).map(h => h.chunk_id));
+  return esc(text || '').replace(/\[([^[\]\n]{3,300})\]/g, (all, inner) => {
+    const ids = inner.split(/\s*[,;]\s*/);
+    if (!ids.every(x => kbChunkRe.test(x))) return all;
+    return ids.map(id => kbCiteHTML(id, known.has(id))).join(' ');
+  });
+}
+function kbCiteHTML(id, found) {
+  const [doc, index] = id.split('/');
+  const title = found ? 'открыть фрагмент в тексте документа' : 'этого фрагмента не было в выдаче — модель могла его выдумать';
+  return `<button type="button" class="kb-cite${found ? '' : ' unknown'}" data-chunk="${esc(id)}" data-doc="${esc(doc)}" data-index="${esc(index)}" data-action="kbOpenChunk" data-arg="${esc(id)}" title="${esc(title)}">[${esc(id)}]</button>`;
+}
+
+// kbRuleTitle — правило словами: что нашлось и чего нет.
+function kbRuleTitle(r) {
+  if (!r) return '';
+  const parts = ['правило: ' + ((kbVerdicts[r.verdict] || [])[1] || r.verdict || '—')];
+  if (kbList(r.hit).length) parts.push('нашлось: ' + r.hit.join(', '));
+  if (kbList(r.miss).length) parts.push('нет: ' + r.miss.join(', '));
+  if (kbList(r.bad).length) parts.push('лишнее: ' + r.bad.join(', '));
+  if (kbList(r.numbers).length) parts.push('числа: ' + r.numbers.join(', '));
+  if (r.note) parts.push(r.note);
+  return parts.join('; ');
+}
+function kbRuleHTML(r) {
+  if (!r || !r.verdict) return '';
+  const bits = [];
+  if (kbList(r.hit).length) bits.push(`нашлось <b>${esc(r.hit.join(', '))}</b>`);
+  if (kbList(r.miss).length) bits.push(`нет <b>${esc(r.miss.join(', '))}</b>`);
+  if (kbList(r.bad).length) bits.push(`лишнее <b>${esc(r.bad.join(', '))}</b>`);
+  if (kbList(r.numbers).length) bits.push(`числа ${esc(r.numbers.join(', '))}`);
+  if (r.note) bits.push(esc(r.note));
+  return `<div class="kb-rule">правило: ${bits.join(' · ') || esc((kbVerdicts[r.verdict] || [])[1] || r.verdict)}</div>`;
+}
+
+// kbExpectHTML — ожидание вопроса из набора.
+function kbExpectHTML(q, id) {
+  if (!q) return '';
+  const e = q.expect || {};
+  const note = e.note || q.note || (q.answerable ? '' : 'в базе ответа нет — правильный исход «не знаю»');
+  const must = kbList(e.must).map(g => kbList(g).join(' / ')).filter(Boolean);
+  return `<div class="kb-expect"${id ? ` id="${esc(id)}"` : ''}>
+    <div><b>${esc(q.id)}</b> <span class="chip">${esc(q.type)}</span>${q.answerable ? '' : ' <span class="chip warn">неотвечаемый</span>'} <span class="kb-expect-l">Ожидание:</span> ${esc(note || '—')}</div>
+    ${must.length ? `<div class="hint">правило ищет: ${must.map(x => `<code>${esc(x)}</code>`).join(' · ')}</div>` : ''}
+    ${kbSources(q) ? `<div class="hint">источники: ${esc(kbSources(q))}</div>` : ''}
+  </div>`;
+}
+
+/* ---------- вкладка «Спросить» ---------- */
+
+function kbAskHTML() {
+  const f = kb.askForm;
+  const qs = kbQuestionList();
+  const groups = ['test', 'dev', 'out'].map(s => [s, qs.filter(q => q.split === s)]).filter(([, l]) => l.length);
+  return `<div id="kb-ask" class="kb-ask">
+    <form id="kb-ask-form" class="kb-form kb-ask-form" data-submit="kbAsk" autocomplete="off">
+      <select id="kb-ask-pick" data-change="kbAskPick" title="вопрос из набора: подставит текст, ответы оценит правило">
+        <option value="">свой вопрос</option>
+        ${groups.map(([s, l]) => `<optgroup label="${esc(kbSplitTitle[s] || s)}">${l.map(q => `<option value="${esc(q.id)}"${q.id === f.qid ? ' selected' : ''}>${esc(q.id + ' · ' + kbCut(q.q, 64))}</option>`).join('')}</optgroup>`).join('')}
+      </select>
+      <input type="text" id="kb-ask-q" value="${esc(f.q)}" placeholder="сколько видов малых панд признаёт MDD v2.5" maxlength="500">
+      <button type="submit" class="solid" id="kb-ask-go"${kb.asking ? ' disabled' : ''}>${kb.asking ? '<span class="thinking">думает</span>' : 'Спросить'}</button>
+    </form>
+    ${kbAskContextHTML()}
+    ${kb.questions && !kb.questions.ok ? `<div class="hint" id="kb-ask-noset">набора вопросов нет: ${esc(kb.questions.error)}${kb.questions.data && kb.questions.data.hint ? ' — ' + esc(kb.questions.data.hint) : ''}</div>` : ''}
+    <div class="hint">Оба режима — один агент без инструментов и один системный промпт; rag получает ещё найденные фрагменты базы. Ссылка [chunk_id] в ответе — к чанку в тексте документа.</div>
+    ${kbAskOutHTML()}
+  </div>`;
+}
+
+// kbAskContextHTML — у вопроса-продолжения: что человек спросил перед ним.
+function kbAskContextHTML() {
+  const q = kbQuestion(kb.askForm.qid);
+  const ctx = kbList(q && q.context);
+  if (!ctx.length) return '<div id="kb-ask-context" hidden></div>';
+  return `<div id="kb-ask-context" class="kb-ask-ctx">Вопрос-продолжение. Перед ним человек спросил: ${ctx.map(c => `<q>${esc(c)}</q>`).join(' → ')} — эти реплики уходят модели историей, а в поиск — вместе с вопросом.</div>`;
+}
+
+function kbAskOutHTML() {
+  if (kb.asking) {
+    return `<div id="kb-ask-out" class="kb-ask-out"><div class="kb-thinking"><span class="thinking">модель отвечает в двух режимах — без базы и с найденными фрагментами</span></div></div>`;
+  }
+  const r = kb.ask;
+  if (!r) {
+    return `<div id="kb-ask-out" class="kb-ask-out kb-results-empty hint">Выберите вопрос из набора — например, T03 о малых пандах в MDD v2.5 — или задайте свой. Платно: два запроса к модели.</div>`;
+  }
+  const d = r.data || {};
+  if (!r.ok && r.code === 503) {
+    return `<div id="kb-ask-out" class="kb-ask-out"><div class="facts-down kb-off" id="kb-ask-off"><b>Спросить нельзя.</b>
+      <div class="kb-why">${esc(d.why || r.error)}</div>${d.hint ? `<div class="facts-hint">${esc(d.hint)}</div>` : ''}</div></div>`;
+  }
+  const answers = kbList(d.answers);
+  if (!r.ok && !answers.length) {
+    return `<div id="kb-ask-out" class="kb-ask-out"><div class="facts-error" id="kb-ask-error">${esc(r.error)}</div></div>`;
+  }
+  const runs = kbList(d.runs);
+  const errs = String(d.error || '').split('; ').filter(Boolean);
+  const errFor = m => (errs.find(e => e.startsWith(m + ': ')) || '').slice(m.length + 2);
+  const q = kbQuestion(r.qid);
+  return `<div id="kb-ask-out" class="kb-ask-out" data-q="${esc(d.q)}" data-qid="${esc(r.qid || '')}">
+    ${kbExpectHTML(q, 'kb-ask-expect')}
+    <div class="kb-answers" id="kb-answers" style="--kb-cols:${Math.max(1, Math.min(answers.length, 2))}">${answers.map(a =>
+      kbAnswerHTML(a, runs.find(x => x.answer && x.answer.mode === a.mode), q, errFor(a.mode))).join('')}</div>
+    ${kbPromptHTML(answers)}
+  </div>`;
+}
+
+// kbAnswerHTML — колонка режима: ответ, вердикт правила, цена; у rag —
+// найденные фрагменты.
+function kbAnswerHTML(a, run, q, err) {
+  const u = a.usage || {};
+  const meta = err ? '' : `<span class="kb-answer-meta" title="цена · токены вопроса → ответа · время">${esc(kbCost(a.cost))} · ${esc(num(u.prompt))} → ${esc(num(u.completion))} ток. · ${esc(kbMs(a.ms))}</span>`;
+  return `<section class="kb-answer" data-mode="${esc(a.mode)}">
+    <div class="kb-answer-head"><b>${esc(kbModeTitle[a.mode] || a.mode)}</b><code>${esc(a.mode)}</code>
+      ${run ? kbVerdictHTML(a.mode, run.final, kbRuleTitle(run.rule), true) : ''}${meta}</div>
+    <div class="kb-answer-sub hint">${esc(kbModeHint[a.mode] || '')}</div>
+    ${err ? `<div class="facts-error kb-answer-error">${esc(err)}</div>` : `<div class="kb-answer-text">${kbAnswerTextHTML(a.text, a.hits)}</div>`}
+    ${run ? kbRuleHTML(run.rule) : ''}
+    ${a.mode === 'rag' && !err ? kbSourcesHTML(a, run, q) : ''}
+  </section>`;
+}
+
+// kbSourcesHTML — выдача поиска под ответом rag: ранг, балл, статья ›
+// раздел, режим поиска (dense или BM25 с причиной отката); фрагменты, на
+// которые ответ сослался, и фрагменты из источников вопроса помечены.
+function kbSourcesHTML(a, run, q) {
+  const hits = kbList(a.hits);
+  const s = a.search || {};
+  const want = new Set(kbList(q && q.sources).map(x => x.doc_id));
+  let recall = '';
+  if (run && q && kbList(q.evidence).length) {
+    recall = run.recall ? '<span class="chip ok kb-recall" data-recall="1">доказательство в выдаче ✓</span>'
+      : '<span class="chip bad kb-recall" data-recall="0">доказательства в выдаче нет ✗</span>';
+  }
+  return `<div class="kb-srcs">
+    <div class="kb-srcs-head"><b>Найденные фрагменты</b>${s.index ? ` <code>${esc(s.index)}</code>` : ''} ${kbModeLine(s)}${recall}</div>
+    ${hits.length ? hits.map(h => {
+      const cited = (a.text || '').includes(h.chunk_id);
+      return `<div class="kb-src${cited ? ' cited' : ''}${want.has(h.doc_id) ? ' want' : ''}" data-chunk="${esc(h.chunk_id)}" data-doc="${esc(h.doc_id)}" data-index="${esc(h.strategy || s.index || '')}" data-action="kbOpenChunk" data-arg="${esc(h.chunk_id)}" title="открыть чанк в тексте документа">
+        <div class="kb-hit-head"><span class="kb-rank">${esc(h.rank)}</span><span class="kb-score">${esc(typeof h.score === 'number' ? h.score.toFixed(3) : '')}</span>
+          <span class="kb-hit-where"><b>${esc(h.title)}</b> › ${esc(kbPath(h))}</span>${cited ? '<span class="chip ok kb-cited">в ответе</span>' : ''}</div>
+        <div class="kb-hit-text">${esc(kbCut(h.text, 200))}</div>
+        <div class="kb-hit-foot"><code>${esc(h.chunk_id)}</code> · ${esc(h.tokens)} ток.</div>
+      </div>`;
+    }).join('') : '<p class="hint">Поиск ничего не нашёл — модель получила строку «в базе знаний ничего не найдено».</p>'}
+  </div>`;
+}
+
+// kbPromptHTML — что ушло модели: видно, что режимы отличаются только
+// контекстом.
+function kbPromptHTML(answers) {
+  const xs = answers.filter(a => a.system || a.user);
+  if (!xs.length) return '';
+  const same = xs.length > 1 && xs.every(a => a.system === xs[0].system);
+  const head = same ? 'системный промпт одинаковый — режимы отличаются только контекстом в сообщении пользователя' : 'System и User по режимам';
+  return `<details class="kb-prompt" id="kb-ask-prompt"><summary>Что ушло модели — ${esc(head)}</summary>
+    <div class="kb-prompt-cols">${xs.map(a => `<div class="kb-prompt-col" data-mode="${esc(a.mode)}">
+      <b>${esc(kbModeTitle[a.mode] || a.mode)}</b>
+      <div class="kb-prompt-l">System · ${esc(num(Array.from(a.system || '').length))} симв.${same ? ' · <span class="chip ok">одинаковый</span>' : ''}</div>
+      <pre class="kb-pre">${esc(a.system)}</pre>
+      <div class="kb-prompt-l">User · ${esc(num(Array.from(a.user || '').length))} симв.</div>
+      <pre class="kb-pre">${esc(a.user)}</pre></div>`).join('')}</div>
+  </details>`;
+}
+
+function kbAskReadForm() {
+  const q = $('kb-ask-q');
+  if (!q) return;
+  kb.askForm.q = q.value;
+  // Текст правили — это уже не вопрос набора: правило его не оценит.
+  const x = kbQuestion(kb.askForm.qid);
+  if (x && x.q !== q.value.trim()) {
+    kb.askForm.qid = '';
+    if ($('kb-ask-pick')) $('kb-ask-pick').value = '';
+    if ($('kb-ask-context')) $('kb-ask-context').outerHTML = kbAskContextHTML();
+  }
+}
+
+async function kbAsk() {
+  if (kb.asking) return;
+  kbAskReadForm();
+  const text = kb.askForm.q.trim();
+  if (!text) { $('kb-ask-q') && $('kb-ask-q').focus(); return; }
+  const q = kbQuestion(kb.askForm.qid);
+  const body = { q: text };
+  if (q) body.question_id = q.id;
+  kb.asking = true;
+  kbPaint('ask');
+  const r = await factsAPI('POST', '/api/kb/ask', body);
+  r.qid = q ? q.id : '';
+  kb.ask = r;
+  kb.asking = false;
+  kbPaint('ask');
+  if (!$('kb-ask-out')) toast(r.ok ? 'Ответы готовы — окно «База знаний», вкладка «Спросить»' : 'Спросить не вышло: ' + r.error, !r.ok);
+}
+
+document.addEventListener('input', ev => { if (ev.target.closest && ev.target.closest('#kb-ask-form')) kbAskReadForm(); });
+
+/* ---------- вкладка «Контрольные вопросы» ---------- */
+
+function kbQaRunning() { return !!(kb.eval && kb.eval.state === 'running'); }
+
+// kbLoadEvals — список прогонов; open — открыть последний, если ни один не
+// открыт (идёт — опрашивать).
+async function kbLoadEvals(open) {
+  kb.evals = await factsAPI('GET', '/api/kb/evals');
+  if (!open || kb.eval || !kb.evals.ok) return;
+  const last = kbList(kb.evals.data)[0];
+  if (!last) return;
+  const r = await factsAPI('GET', '/api/kb/evals/' + encodeURIComponent(last.id));
+  if (!r.ok || kb.eval) return;
+  kb.eval = r.data;
+  if (kbQaRunning()) kb.timer = setTimeout(kbQaPoll, kb.pollMs);
+}
+
+function kbQaHTML() {
+  const f = kb.qaForm;
+  return `<div id="kb-qa" class="kb-qa">
+    <form id="kb-qa-form" class="kb-form kb-qa-form" data-submit="kbQaRun" autocomplete="off">
+      <label class="lbl" for="kb-qa-repeats">повторы</label>
+      <select id="kb-qa-repeats">${[1, 2, 3].map(n => `<option value="${n}"${n === f.repeats ? ' selected' : ''}>${n}</option>`).join('')}</select>
+      <label class="kb-check" title="второй голос: судья-модель видит вопрос, ожидание и один ответ без пометки режима"><input type="checkbox" id="kb-qa-judge"${f.judge ? ' checked' : ''}> судья-модель</label>
+      <button type="submit" class="solid" id="kb-qa-run"${kbQaRunning() || kb.starting ? ' disabled' : ''}>Прогнать набор test</button>
+      <span class="hint">Платно: 10 вопросов × 2 режима × повторы; судья — ещё запрос на каждый ответ.</span>
+    </form>
+    ${kbQaLiveHTML()}
+    ${kbQaRunsHTML()}
+  </div>`;
+}
+
+// kbQaQuestions — вопросы таблицы: наборы прогона (по умолчанию test);
+// набора нет — вопросы из строк прогона.
+function kbQaQuestions() {
+  const v = kb.eval;
+  const splits = v && kbList(v.request && v.request.splits).length ? v.request.splits : ['test'];
+  const qs = kbQuestionList().filter(q => splits.includes(q.split));
+  if (qs.length) return qs;
+  return kbList(v && v.rows).map(r => r.question).filter(Boolean);
+}
+
+function kbQaErrorHTML() {
+  const e = kb.evalError;
+  if (!e) return '';
+  if (e.code === 503) {
+    return `<div class="facts-down kb-off" id="kb-qa-off"><b>Прогон запустить нельзя.</b><div class="kb-why">${esc(e.why || e.text)}</div>${e.hint ? `<div class="facts-hint">${esc(e.hint)}</div>` : ''}</div>`;
+  }
+  if (e.code === 409 && e.id) {
+    return `<div class="facts-error" id="kb-qa-error" data-code="409">${esc(e.text)} <button type="button" class="small" data-action="kbQaOpen" data-arg="${esc(e.id)}">открыть ${esc(e.id)}</button></div>`;
+  }
+  return `<div class="facts-error" id="kb-qa-error" data-code="${esc(e.code)}">${esc(e.text)}${e.hint ? ' — ' + esc(e.hint) : ''}</div>`;
+}
+
+function kbQaLiveHTML() {
+  const v = kb.eval;
+  let html = `<div id="kb-qa-live" class="kb-qa-live">${kbQaErrorHTML()}`;
+  if (kb.questions && !kb.questions.ok) {
+    html += `<div class="facts-error" id="kb-qa-noset">набора вопросов нет: ${esc(kb.questions.error)}${kb.questions.data && kb.questions.data.hint ? ' — ' + esc(kb.questions.data.hint) : ''}</div>`;
+  }
+  if (v) {
+    const pct = v.total ? Math.round(100 * (v.done || 0) / v.total) : 0;
+    const req = v.request || {};
+    const state = v.state === 'running' ? '<span class="thinking">идёт</span>'
+      : v.state === 'done' ? '<span class="chip ok">готово</span>' : '<span class="chip bad">сбой</span>';
+    html += `<div class="kb-qa-status" id="kb-qa-status" data-run="${esc(v.id)}" data-state="${esc(v.state)}">
+      <b>Прогон ${esc(v.id)}</b> ${state}
+      <span id="kb-qa-count">${esc(v.done || 0)} из ${esc(v.total || 0)} ответов</span>
+      <span class="hint">повторов ${esc(req.repeats || 1)} · ${req.judge ? 'правило и судья' : 'только правило'} · начат ${esc(kbTime(v.started))}</span>
+      <div class="kb-progress"><span style="width:${pct}%"></span></div>
+      ${v.error ? `<div class="facts-error">${esc(v.error)}</div>` : ''}
+    </div>`;
+  }
+  const qs = kbQaQuestions();
+  const rows = kbList(v && v.rows);
+  const modes = v && kbList(v.request && v.request.modes).length ? v.request.modes : kbModes;
+  if (qs.length) {
+    html += `<table class="grid kb-table kb-qa-table" id="kb-qa-table"><tr><th>id</th><th>тип</th><th>вопрос</th><th>ожидание</th><th>источники</th>
+      ${kbModes.map(m => `<th class="kb-qa-v" data-mode="${esc(m)}">${esc(kbModeTitle[m])}</th>`).join('')}<th class="kb-qa-v" title="нашёлся ли в выдаче rag фрагмент с доказательством">источник найден</th></tr>
+      ${qs.map(q => kbQaRowHTML(q, rows.find(r => r.question && r.question.id === q.id), modes)).join('')}</table>`;
+  }
+  if (v && v.report) html += kbQaSummaryHTML(v.report, v);
+  return html + '</div>';
+}
+
+function kbQaRowHTML(q, row, modes) {
+  const open = !!kb.qaOpen[q.id];
+  const running = kbQaRunning();
+  const e = q.expect || {};
+  const exp = e.note || (q.answerable ? '' : 'в базе нет — ждём «не знаю»');
+  const cell = m => {
+    if (!modes.includes(m)) return '<span class="hint">—</span>';
+    const runs = kbList(row && row.runs && row.runs[m]);
+    if (!runs.length) return running || row ? kbVerdictHTML(m, '') : '';
+    const v = (row.majority || {})[m] || runs[runs.length - 1].final;
+    const flips = (row.flips || {})[m] || 0;
+    const title = runs.map(r => 'повтор ' + r.repeat + ': ' + ((kbVerdicts[r.final] || [])[1] || r.final || 'ошибка')).join('; ') + (flips ? '; флипов ' + flips : '');
+    const icon = x => (x === 'abstain' ? '?' : (kbVerdicts[x] || ['!'])[0]);
+    const reps = runs.length > 1 ? `<span class="kb-reps" title="по повторам">${esc(runs.map(r => icon(r.final)).join(''))}</span>` : '';
+    return kbVerdictHTML(m, v, title) + reps;
+  };
+  let found = '';
+  const ragRuns = kbList(row && row.runs && row.runs.rag);
+  if (!kbList(q.evidence).length) found = '<span class="hint" title="у вопроса нет доказательства в базе">—</span>';
+  else if (ragRuns.length) {
+    found = ragRuns.some(r => r.recall) ? '<span class="kb-found yes" data-found="1" title="фрагмент с доказательством в выдаче">✓</span>'
+      : '<span class="kb-found no" data-found="0" title="доказательства в выдаче нет">✗</span>';
+  } else if (running) found = '<span class="kb-verdict pending">…</span>';
+  let html = `<tr class="kb-qa-row${open ? ' open' : ''}${row ? ' has' : ''}" data-id="${esc(q.id)}" data-action="kbQaToggle" data-arg="${esc(q.id)}" title="ответы обоих режимов и причины оценок">
+    <td><b>${esc(q.id)}</b></td><td><span class="chip">${esc(q.type)}</span></td>
+    <td class="kb-qa-q">${esc(q.q)}${kbList(q.context).length ? `<div class="hint">после: ${q.context.map(c => `«${esc(c)}»`).join(' → ')}</div>` : ''}</td>
+    <td class="kb-qa-exp">${esc(kbCut(exp, 110))}</td><td class="kb-qa-src hint">${esc(kbSources(q))}</td>
+    ${kbModes.map(m => `<td class="kb-qa-v" data-mode="${esc(m)}">${cell(m)}</td>`).join('')}<td class="kb-qa-v">${found}</td></tr>`;
+  if (open) html += `<tr class="kb-qa-detail" data-id="${esc(q.id)}"><td colspan="${5 + kbModes.length + 1}">${kbQaDetailHTML(q, row, modes)}</td></tr>`;
+  return html;
+}
+
+// kbQaDetailHTML — раскрытая строка: ответы режимов по повторам, оценки
+// правила и судьи с причиной.
+function kbQaDetailHTML(q, row, modes) {
+  if (!row) return `${kbExpectHTML(q)}<p class="hint">${kbQaRunning() ? 'Ответов на этот вопрос ещё нет — прогон идёт.' : 'Этот вопрос ещё не прогонялся.'}</p>`;
+  return `${kbExpectHTML(q)}<div class="kb-answers" style="--kb-cols:${Math.max(1, modes.length)}">${modes.map(m => {
+    const runs = kbList(row.runs && row.runs[m]);
+    return `<section class="kb-answer" data-mode="${esc(m)}">
+      <div class="kb-answer-head"><b>${esc(kbModeTitle[m] || m)}</b><code>${esc(m)}</code></div>
+      ${runs.length ? runs.map(r => {
+        const a = r.answer || {};
+        const j = r.judge;
+        return `<div class="kb-run" data-repeat="${esc(r.repeat)}">
+          <div class="kb-run-head">${runs.length > 1 ? `<span class="hint">повтор ${esc(r.repeat)}</span>` : ''}
+            итог ${kbVerdictHTML(m, r.final, '', true)}
+            <span class="hint">правило</span> ${kbVerdictHTML(m, r.rule && r.rule.verdict, kbRuleTitle(r.rule))}
+            ${j ? `<span class="hint">судья</span> ${kbVerdictHTML(m, j.verdict, j.reason)}` : ''}
+            <span class="kb-answer-meta">${esc(kbCost(a.cost))} · ${esc(kbMs(a.ms))}</span></div>
+          ${r.error ? `<div class="facts-error">${esc(r.error)}</div>` : `<div class="kb-answer-text">${kbAnswerTextHTML(a.text, a.hits)}</div>`}
+          ${j && j.reason ? `<div class="kb-judge"><b>судья:</b> ${esc(j.reason)}</div>` : ''}
+          ${kbRuleHTML(r.rule)}
+        </div>`;
+      }).join('') : '<p class="hint">ответа нет</p>'}
+    </section>`;
+  }).join('')}</div>`;
+}
+
+const kbQaMetrics = [
+  ['questions', 'вопросов', s => num(s.questions)],
+  ['correct', 'верно', s => num(s.correct), 'max'],
+  ['partial', 'частично', s => num(s.partial)],
+  ['wrong', 'неверно', s => num(s.wrong), 'min'],
+  ['abstain', '«не знаю»', s => num(s.abstain)],
+  ['confident_wrong', 'уверенные ошибки', s => num(s.confident_wrong), 'min'],
+  ['right_abstain', '«не знаю» там, где ответа нет', s => num(s.right_abstain), 'max'],
+  ['recall', 'recall доказательств', s => (s.mode === 'norag' ? '—' : kbNum2(s.recall))],
+  ['agreement', 'согласие правила и судьи', s => kbPct(s.agreement)],
+  ['flip_rate', 'флипы между повторами', s => kbPct(s.flip_rate)],
+  ['tokens', 'токенов', s => num((s.usage || {}).total)],
+  ['cost', 'цена', s => kbCost(s.cost)],
+  ['avg_ms', 'среднее время ответа', s => kbMs(s.avg_ms)],
+];
+
+function kbQaSummaryHTML(rep, v) {
+  const stats = kbList(rep.stats);
+  const req = (v && v.request) || {};
+  const cards = stats.map(s => `<div class="kb-qa-card" data-mode="${esc(s.mode)}">
+    <span>${esc(kbModeTitle[s.mode] || s.mode)}</span>
+    <b>${esc(s.correct)}<small> из ${esc(s.questions)}</small></b>
+    <span class="hint">частично ${esc(s.partial)} · «не знаю» ${esc(s.abstain)} · уверенных ошибок ${esc(s.confident_wrong)}</span></div>`).join('');
+  const val = (s, k) => { const x = k === 'tokens' ? (s.usage || {}).total : k === 'cost' ? (s.cost || {}).usd : s[k]; return typeof x === 'number' ? x : null; };
+  const best = (k, dir, s) => {
+    if (!dir || stats.length < 2) return '';
+    const xs = stats.map(y => val(y, k)).filter(x => x !== null);
+    const x = val(s, k);
+    if (x === null || xs.every(y => y === x)) return '';
+    return x === (dir === 'max' ? Math.max(...xs) : Math.min(...xs)) ? ' best' : '';
+  };
+  const metrics = kbQaMetrics.filter(([k]) => (k !== 'agreement' || req.judge) && (k !== 'flip_rate' || (rep.repeats || req.repeats) > 1));
+  const created = rep.created ? kbTime(rep.created) : '';
+  return `<div id="kb-qa-summary" class="kb-qa-summary">
+    <h4 class="kb-h">Итог</h4>
+    <div class="kb-report-meta">${created ? `<span>от <b>${esc(created)}</b></span>` : ''}${rep.model ? `<span>модель <b>${esc(rep.model)}</b></span>` : ''}
+      ${rep.index ? `<span>индекс <b>${esc(rep.index)}</b>, k ${esc(rep.k)}</span>` : ''}${rep.embedder ? `<span>эмбеддер <b>${esc(rep.embedder)}</b></span>` : ''}
+      <span>повторов ${esc(rep.repeats || req.repeats || 1)}</span>${req.judge ? `<span>судья ${esc(kbCost(rep.judge_cost))}</span>` : ''}</div>
+    <div class="kb-qa-cards">${cards}</div>
+    <table class="grid kb-table kb-qa-stats" id="kb-qa-stats"><tr><th></th>${stats.map(s => `<th class="kb-r" data-mode="${esc(s.mode)}">${esc(kbModeTitle[s.mode] || s.mode)}</th>`).join('')}</tr>
+      ${metrics.map(([k, label, f, dir]) => `<tr data-metric="${esc(k)}"><td>${esc(label)}</td>${stats.map(s => `<td class="kb-r${best(k, dir, s)}" data-mode="${esc(s.mode)}">${esc(f(s))}</td>`).join('')}</tr>`).join('')}</table>
+    ${kbList(rep.conclusion).length ? `<h4 class="kb-h">Вывод</h4><ul class="kb-conclusion" id="kb-qa-conclusion">${rep.conclusion.map(x => `<li>${esc(x)}</li>`).join('')}</ul>` : ''}
+    ${kbList(rep.disagreements).length ? `<details class="kb-questions"><summary>Правило и судья разошлись: ${esc(rep.disagreements.length)}</summary><ul>${rep.disagreements.map(x => `<li>${esc(x)}</li>`).join('')}</ul></details>` : ''}
+  </div>`;
+}
+
+function kbTime(s) {
+  if (!s) return '—';
+  const d = new Date(s);
+  return isNaN(d) ? String(s) : d.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+// kbQaRunsHTML — прошлые прогоны (новые первыми); клик открывает прогон.
+function kbQaRunsHTML() {
+  const r = kb.evals;
+  const list = r && r.ok ? kbList(r.data) : [];
+  if (!list.length) return '<div id="kb-qa-runs" hidden></div>';
+  const cur = kb.eval && kb.eval.id;
+  return `<div id="kb-qa-runs" class="kb-qa-runs"><h4 class="kb-h">Прогоны</h4>${list.map(x => {
+    const st = kbList(x.report && x.report.stats);
+    const by = m => st.find(s => s.mode === m);
+    const score = st.length ? kbModes.filter(by).map(m => `${kbModeTitle[m]} ${by(m).correct}/${by(m).questions}`).join(' · ') : '';
+    const cost = st.length ? kbCost(st.reduce((c, s) => ({ usd: c.usd + ((s.cost || {}).usd || 0), known: c.known && (s.cost || {}).known }), { usd: 0, known: true })) : '';
+    const state = x.state === 'running' ? 'идёт' : x.state === 'done' ? 'готово' : 'сбой';
+    return `<button type="button" class="kb-qa-run${x.id === cur ? ' on' : ''}" data-run="${esc(x.id)}" data-state="${esc(x.state)}" data-action="kbQaOpen" data-arg="${esc(x.id)}">
+      <b>${esc(x.id)}</b> <span>${esc(kbTime(x.started))}</span> <span class="chip${x.state === 'done' ? ' ok' : x.state === 'failed' ? ' bad' : ''}">${esc(state)}</span>
+      <span class="hint">×${esc((x.request || {}).repeats || 1)}${(x.request || {}).judge ? ', судья' : ''}</span>${score ? ` <span>${esc(score)}</span>` : ''}${cost ? ` <span class="hint">${esc(cost)}</span>` : ''}</button>`;
+  }).join('')}</div>`;
+}
+
+function kbQaReadForm() {
+  const r = $('kb-qa-repeats'), j = $('kb-qa-judge');
+  if (r) kb.qaForm.repeats = Number(r.value) || 1;
+  if (j) kb.qaForm.judge = j.checked;
+}
+document.addEventListener('change', ev => { if (ev.target.closest && ev.target.closest('#kb-qa-form')) kbQaReadForm(); });
+
+async function kbQaRun() {
+  if (kb.starting) return;
+  kbQaReadForm();
+  kb.starting = true;
+  kbPaint();
+  const r = await factsAPI('POST', '/api/kb/evals', { repeats: kb.qaForm.repeats, judge: kb.qaForm.judge });
+  kb.starting = false;
+  if (r.ok) {
+    kb.eval = r.data;
+    kb.evalError = null;
+    kb.qaOpen = {};
+    kb.watching = true;
+    kbPaint('qa');
+    kbQaPoll();
+    await kbLoadEvals(false);
+    kbPaint('runs');
+  } else {
+    const d = r.data || {};
+    kb.evalError = { code: r.code, text: r.error, id: d.id, why: d.why, hint: d.hint };
+    kbPaint('qa');
+  }
+}
+
+function kbQaStopPoll() {
+  if (kb.timer) clearTimeout(kb.timer);
+  kb.timer = null;
+}
+
+// kbQaPoll — GET прогона раз в kb.pollMs, пока он идёт. Опрос идёт и при
+// закрытом окне: об итоге скажет тост. Новый вызов отменяет прежний цикл.
+async function kbQaPoll() {
+  kbQaStopPoll();
+  const id = kb.eval && kb.eval.id;
+  const seq = ++kb.seq;
+  if (!id) return;
+  const r = await factsAPI('GET', '/api/kb/evals/' + encodeURIComponent(id));
+  if (kb.seq !== seq || !kb.eval || kb.eval.id !== id) return; // тем временем открыли другой прогон
+  if (r.ok) kb.eval = r.data;
+  else kb.evalError = { code: r.code, text: r.error };
+  const done = !r.ok || !kbQaRunning();
+  if (done) {
+    await kbLoadEvals(false);
+    if (kb.seq !== seq) return;
+  }
+  kbPaint('qa', done ? 'runs' : '');
+  if (!done) {
+    kb.timer = setTimeout(kbQaPoll, kb.pollMs);
+    return;
+  }
+  if (kb.watching && !$('kb-qa') && r.ok) {
+    const st = kbList(kb.eval.report && kb.eval.report.stats).find(s => s.mode === 'rag');
+    toast('Контрольные вопросы: ' + (kb.eval.state === 'done' ? 'прогон готов' + (st ? `, с базой верно ${st.correct} из ${st.questions}` : '') : 'сбой — подробности в окне «База знаний»'), kb.eval.state !== 'done');
+  }
+  kb.watching = false;
+}
+
+Object.assign(actions, {
+  kbAsk() { kbAsk(); },
+  kbAskPick(id) {
+    kb.askForm.qid = id || '';
+    const q = kbQuestion(id);
+    if (q) {
+      kb.askForm.q = q.q;
+      if ($('kb-ask-q')) $('kb-ask-q').value = q.q;
+    }
+    if ($('kb-ask-context')) $('kb-ask-context').outerHTML = kbAskContextHTML();
+  },
+  kbQaRun() { kbQaRun(); },
+  kbQaToggle(id) {
+    if (!id) return;
+    kb.qaOpen[id] = !kb.qaOpen[id];
+    kbPaint('qa');
+  },
+  async kbQaOpen(id) {
+    if (!id) return;
+    const r = await factsAPI('GET', '/api/kb/evals/' + encodeURIComponent(id));
+    if (!r.ok) { toast('Прогон не открылся: ' + r.error, true); return; }
+    kbQaStopPoll();
+    kb.seq++;
+    kb.eval = r.data;
+    kb.evalError = null;
+    kb.qaOpen = {};
+    kbPaint('qa', 'runs');
+    if (kbQaRunning()) kb.timer = setTimeout(kbQaPoll, kb.pollMs);
+  },
+});
+
 /* ---------- действия ---------- */
 
 Object.assign(actions, {
   async kbTab(tab) {
     if (!kbTabs.some(([id]) => id === tab)) return;
     if (kb.tab === 'search') kbReadForm();
+    if (kb.tab === 'ask') kbAskReadForm();
     kb.tab = tab;
     if (tab !== 'chunks') kb.focus = '';
     kbPaint('tabs', 'body');
@@ -524,6 +1115,11 @@ Object.assign(actions, {
     if (tab === 'report' && (!kb.report || !kb.report.ok)) {
       await kbLoadReport();
       if (kb.tab === 'report') kbPaint('body');
+    }
+    if ((tab === 'ask' || tab === 'qa') && kbBase()) {
+      await kbLoadTab();
+      if (kb.tab === tab) kbPaint('body');
+      if (tab === 'qa' && kbQaRunning()) kbQaPoll();
     }
   },
   async kbOpenDoc(id) {
@@ -539,6 +1135,7 @@ Object.assign(actions, {
   async kbOpenChunk(id, el) {
     if (!id || !el) return;
     kbReadForm();
+    kbAskReadForm();
     kb.doc = el.dataset.doc || kb.doc;
     if (el.dataset.index) kb.strategy = el.dataset.index;
     kb.focus = id;

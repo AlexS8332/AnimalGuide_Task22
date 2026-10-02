@@ -994,10 +994,11 @@
       assert(b.title.includes('hash-256'), 'подсказка: ' + b.title);
     });
 
-    await check('база знаний: четыре вкладки, корпус', async () => {
+    await check('база знаний: шесть вкладок, корпус', async () => {
       await openKB();
       const tabs = qa('[data-kb-tab]').map(x => x.dataset.kbTab);
-      assert(tabs.join(',') === 'docs,chunks,search,report', 'вкладки: ' + tabs);
+      assert(tabs.join(',') === 'docs,chunks,search,ask,qa,report', 'вкладки: ' + tabs);
+      assert(text('[data-kb-tab="ask"]') === 'Спросить' && text('[data-kb-tab="qa"]') === 'Контрольные вопросы', 'надписи вкладок v22');
       assert(q('[data-kb-tab="docs"]').classList.contains('active'), 'открыта не «Корпус»');
       assert(text('[data-kb-tab="chunks"]') === 'Чанки' && text('[data-kb-tab="search"]') === 'Поиск' && text('[data-kb-tab="report"]') === 'Сравнение', 'надписи вкладок');
       const n = Number(text('#kb-n-docs'));
@@ -1150,11 +1151,262 @@
     });
 
     await check('база знаний: без базы вкладки ведут к той же подсказке', async () => {
-      for (const tab of ['search', 'chunks', 'report']) {
+      for (const tab of ['search', 'chunks', 'ask', 'qa', 'report']) {
         click(`[data-kb-tab="${tab}"]`);
         await until('вкладка ' + tab, () => q(`[data-kb-tab="${tab}"]`).classList.contains('active') && q('#kb-off'));
       }
-      assert(!q('#kb-search-form') && !q('#kb-report-meta'), 'вкладки без базы');
+      assert(!q('#kb-search-form') && !q('#kb-report-meta') && !q('#kb-ask-form') && !q('#kb-qa-form'), 'вкладки без базы');
+      assert(factsCalls.filter(x => x.url.includes('/api/kb/ask') || x.url.includes('/api/kb/evals')).length === 0, 'окно спросило модель без базы');
+    });
+
+    await check('база знаний: без базы ask отвечает 503 с причиной и подсказкой', async () => {
+      const r = await factsAPI('POST', '/api/kb/ask', { q: 'манул' });
+      assert(r.code === 503 && r.data.why.includes('базы знаний нет') && r.data.hint.includes('go run ./cmd/kb index'), 'ответ: ' + r.code + ' ' + JSON.stringify(r.data));
+    });
+  };
+
+  // ===== «Спросить» и «Контрольные вопросы» (v22) =====
+
+  /* REST — тот же kbapi, но отвечающий агент подставной (edgeRAG в
+     edge_rag_test): заготовки по вопросам набора test, фрагменты — настоящий
+     поиск BM25, ссылки [chunk_id] — настоящие чанки. Прогон отдаёт вопрос
+     за опросом. */
+  async function kbTabOpen(tab, what) {
+    click(`[data-kb-tab="${tab}"]`);
+    await until('вкладка ' + tab, () => q(`[data-kb-tab="${tab}"]`).classList.contains('active') && q(what), 8000);
+  }
+  function kbPick(id) {
+    const sel = $('kb-ask-pick');
+    sel.value = id;
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  const kbAnswer = m => q(`#kb-answers .kb-answer[data-mode="${m}"]`);
+  const kbAskCalls = () => factsCalls.filter(x => x.url.includes('/api/kb/ask'));
+  async function kbAskGo(qtext) {
+    const n = kbAskCalls().length;
+    click('#kb-ask-go');
+    assert(q('#kb-ask-out .kb-thinking') && $('kb-ask-go').disabled, 'нет индикатора «думает»');
+    await until('ответы', () => q('#kb-answers') && q('#kb-ask-out').dataset.q === qtext && !$('kb-ask-go').disabled, 8000);
+    assert(kbAskCalls().length === n + 1, 'запросов ask: ' + (kbAskCalls().length - n));
+    return JSON.parse(kbAskCalls().pop().body);
+  }
+
+  scenarios['kb-ask'] = async () => {
+    spyFetch();
+    await booted();
+    window.__xss = undefined;
+    let t03 = '';
+
+    await check('спросить: вкладка и набор вопросов в выборе', async () => {
+      await openKB();
+      await kbTabOpen('ask', '#kb-ask-pick optgroup');
+      const groups = qa('#kb-ask-pick optgroup').map(g => g.label);
+      assert(groups.length === 3 && groups[0].startsWith('test') && groups[2].startsWith('out'), 'группы: ' + groups);
+      assert(qa('#kb-ask-pick optgroup')[0].querySelectorAll('option').length === 10, 'test не 10');
+      assert(q('#kb-ask-pick option[value="T03"]').textContent.startsWith('T03 · '), 'подпись T03');
+      assert(text('#kb-ask-out').includes('T03'), 'подсказка: ' + text('#kb-ask-out'));
+      assert(!q('.kb-answer'), 'ответы до вопроса');
+    });
+
+    await check('спросить: T03 из набора, ответы двумя колонками рядом, вердикты правила', async () => {
+      kbPick('T03');
+      t03 = $('kb-ask-q').value;
+      assert(t03.includes('MDD v2.5'), 'текст не подставился: ' + t03);
+      const body = await kbAskGo(t03);
+      assert(body.q === t03 && body.question_id === 'T03', 'тело: ' + JSON.stringify(body));
+      const cols = qa('#kb-answers .kb-answer').map(x => x.dataset.mode);
+      assert(cols.join(',') === 'norag,rag', 'колонки: ' + cols);
+      const a = kbAnswer('norag').getBoundingClientRect(), b = kbAnswer('rag').getBoundingClientRect();
+      assert(Math.abs(a.top - b.top) < 2 && b.left > a.right - 1, 'колонки не рядом');
+      assert(kbAnswer('norag').querySelector('.kb-verdict[data-mode="norag"]').dataset.verdict === 'wrong', 'вердикт norag: ' + text('.kb-answer[data-mode="norag"] .kb-verdict'));
+      assert(kbAnswer('rag').querySelector('.kb-verdict[data-mode="rag"]').dataset.verdict === 'correct', 'вердикт rag');
+      assert(text('.kb-answer[data-mode="rag"] .kb-verdict').includes('✓') && text('.kb-answer[data-mode="norag"] .kb-verdict').includes('✗'), 'значки');
+      assert(text('.kb-answer[data-mode="norag"] .kb-answer-text').includes('единственный вид'), 'ответ norag');
+      assert(text('.kb-answer[data-mode="rag"] .kb-answer-text').includes('Ailurus styani'), 'ответ rag');
+      assert(text('#kb-ask-expect').includes('T03') && text('#kb-ask-expect').includes('Ailurus'), 'ожидание: ' + text('#kb-ask-expect'));
+      assert(text('.kb-answer[data-mode="rag"] .kb-rule').includes('нашлось'), 'правило: ' + text('.kb-answer[data-mode="rag"] .kb-rule'));
+      for (const m of ['norag', 'rag']) {
+        const meta = kbAnswer(m).querySelector('.kb-answer-meta').textContent;
+        assert(/\$0\.\d{4}/.test(meta) && meta.includes('ток.') && /\d с|мс/.test(meta), 'цена/токены/время ' + m + ': ' + meta);
+      }
+      assert(!kbAnswer('norag').querySelector('.kb-src'), 'фрагменты у norag');
+    });
+
+    await check('спросить: у rag найденные фрагменты с рангом, баллом, разделом и режимом поиска', async () => {
+      const src = qa('.kb-answer[data-mode="rag"] .kb-src');
+      assert(src.length === 5, 'фрагментов ' + src.length);
+      src.forEach((x, i) => {
+        assert(x.querySelector('.kb-rank').textContent === String(i + 1), 'ранг');
+        assert(/^\d\.\d{3}$/.test(x.querySelector('.kb-score').textContent), 'балл: ' + x.querySelector('.kb-score').textContent);
+        assert(x.querySelector('.kb-hit-where').textContent.includes('›'), 'статья › раздел');
+        assert(/^[a-z0-9-]+\/structure\/\d{3}$/.test(x.dataset.chunk), 'chunk_id: ' + x.dataset.chunk);
+      });
+      assert(q('.kb-answer[data-mode="rag"] .kb-srcs-head .kb-mode.bm25'), 'режим поиска: ' + text('.kb-answer[data-mode="rag"] .kb-srcs-head'));
+      assert(q('.kb-answer[data-mode="rag"] .kb-src.cited .kb-cited'), 'фрагмент из ответа не помечен');
+      assert(q('.kb-answer[data-mode="rag"] .kb-recall'), 'нет пометки recall');
+    });
+
+    await check('спросить: «что ушло модели», режимы отличаются только контекстом', async () => {
+      const d = $('kb-ask-prompt');
+      assert(d && !d.open, 'блок раскрыт сразу');
+      d.open = true;
+      assert(text('#kb-ask-prompt summary').includes('одинаковый'), 'заголовок: ' + text('#kb-ask-prompt summary'));
+      const col = m => q(`#kb-ask-prompt .kb-prompt-col[data-mode="${m}"]`);
+      const pre = m => [...col(m).querySelectorAll('.kb-pre')].map(x => x.textContent);
+      assert(pre('norag')[0] === pre('rag')[0] && pre('norag')[0].includes('справочник'), 'System разный');
+      assert(pre('norag')[1] === t03 && pre('rag')[1].startsWith(t03) && pre('rag')[1].includes('Фрагменты базы знаний'), 'User');
+      d.open = false;
+    });
+
+    await check('спросить: клик по [chunk_id] в ответе ведёт к чанку', async () => {
+      const cite = q('.kb-answer[data-mode="rag"] .kb-answer-text .kb-cite');
+      assert(cite && !cite.classList.contains('unknown'), 'нет ссылки на фрагмент');
+      const id = cite.dataset.chunk, doc = id.split('/')[0];
+      assert(cite.textContent === '[' + id + ']', 'надпись ссылки: ' + cite.textContent);
+      click(cite);
+      await until('чанк', () => q(`#kb-text[data-doc="${doc}"][data-index="structure"] .kb-chunk.focus[data-id="${id}"]`), 8000);
+      assert(q('[data-kb-tab="chunks"]').classList.contains('active') && $('kb-doc').value === doc, 'вкладка и документ');
+      await kbTabOpen('ask', '#kb-answers');
+      assert($('kb-ask-q').value === t03 && $('kb-ask-pick').value === 'T03', 'форма сброшена');
+    });
+
+    await check('спросить: вопрос-продолжение показывает контекст, правка текста снимает выбор', async () => {
+      kbPick('T08');
+      assert(text('#kb-ask-context').includes('Где в России водится харза?'), 'контекст: ' + text('#kb-ask-context'));
+      $('kb-ask-q').value = 'А сколько весит манул?';
+      $('kb-ask-q').dispatchEvent(new Event('input', { bubbles: true }));
+      assert($('kb-ask-pick').value === '' && $('kb-ask-context').hidden, 'выбор не снят');
+    });
+
+    await check('спросить: разметка в ответе модели выводится буквами, переносы строк сохранены', async () => {
+      $('kb-ask-q').value = 'ответь разметкой про ксенофоба';
+      $('kb-ask-q').dispatchEvent(new Event('input', { bubbles: true }));
+      const body = await kbAskGo('ответь разметкой про ксенофоба');
+      assert(!body.question_id, 'свой вопрос ушёл с question_id');
+      const t = kbAnswer('norag').querySelector('.kb-answer-text');
+      assert(t.textContent.includes('<b>жирной</b>') && t.textContent.includes('<script>window.__xss=44</script>') && t.textContent.includes('<img src=x'), 'текст: ' + t.textContent);
+      assert(t.textContent.includes('\n') && getComputedStyle(t).whiteSpace === 'pre-wrap', 'перенос строки');
+      assert(text('.kb-answer[data-mode="rag"] .kb-answer-text').includes('<i>курсив</i>'), 'rag: ' + text('.kb-answer[data-mode="rag"] .kb-answer-text'));
+      assert(q('.kb-src[data-doc="xss-test"]'), 'нет фрагмента xss-test');
+      assert(!q('.kb-answer-text b, .kb-answer-text i, .kb-answer-text script, .kb-answer-text img, .kb-src img, .kb-src script, .kb-pre *'), 'элемент из ответа модели');
+      assert(!q('#kb-answers .kb-verdict'), 'вердикт у своего вопроса');
+      await sleep(100);
+      assert(window.__xss === undefined, 'исполнился код: __xss=' + window.__xss);
+    });
+
+    await check('спросить: пустой вопрос не уходит', async () => {
+      const n = kbAskCalls().length;
+      $('kb-ask-q').value = '   ';
+      $('kb-ask-q').dispatchEvent(new Event('input', { bubbles: true }));
+      click('#kb-ask-go');
+      await sleep(100);
+      assert(kbAskCalls().length === n, 'ушёл пустой вопрос');
+    });
+  };
+
+  const kbRow = id => q(`#kb-qa-table .kb-qa-row[data-id="${id}"]`);
+  const kbRowV = (id, m) => kbRow(id).querySelector(`.kb-verdict[data-mode="${m}"]`);
+  async function kbQaStart(repeats, judge) {
+    app.kb.pollMs = 150;
+    $('kb-qa-repeats').value = String(repeats);
+    $('kb-qa-repeats').dispatchEvent(new Event('change', { bubbles: true }));
+    $('kb-qa-judge').checked = judge;
+    $('kb-qa-judge').dispatchEvent(new Event('change', { bubbles: true }));
+    click('#kb-qa-run');
+    await until('прогон начат', () => q('#kb-qa-status[data-state="running"]'), 8000);
+  }
+
+  scenarios['kb-qa'] = async () => {
+    spyFetch();
+    await booted();
+    window.__xss = undefined;
+
+    await check('контрольные вопросы: таблица набора test', async () => {
+      await openKB();
+      await kbTabOpen('qa', '#kb-qa-table .kb-qa-row');
+      const ids = qa('#kb-qa-table .kb-qa-row').map(r => r.dataset.id);
+      assert(ids.join(',') === 'T01,T02,T03,T04,T05,T06,T07,T08,T09,T10', 'строки: ' + ids);
+      assert(kbRow('T03').textContent.includes('MDD v2.5') && kbRow('T03').textContent.includes('conflict') && kbRow('T03').textContent.includes('mdd-carnivora'), 'строка T03: ' + kbRow('T03').textContent);
+      assert(kbRow('T08').textContent.includes('после: «Где в России водится харза?»'), 'контекст T08');
+      assert(kbRow('T10').querySelector('.kb-qa-exp').textContent.includes('в базе нет'), 'ожидание T10');
+      assert(!q('#kb-qa-table .kb-verdict'), 'вердикты до прогона');
+      assert($('kb-qa-repeats').value === '1' && $('kb-qa-judge').checked && !$('kb-qa-run').disabled, 'настройки');
+    });
+
+    await check('контрольные вопросы: прогон заполняет строки по ходу', async () => {
+      await kbQaStart(1, true);
+      assert($('kb-qa-run').disabled, 'кнопка не выключена');
+      const body = JSON.parse(factsCalls.filter(x => x.url.endsWith('/api/kb/evals') && x.method === 'POST').pop().body);
+      assert(body.repeats === 1 && body.judge === true, 'тело: ' + JSON.stringify(body));
+      await until('часть строк готова', () => {
+        const done = qa('#kb-qa-table .kb-qa-row .kb-verdict[data-mode="rag"]:not(.pending)').length;
+        return done >= 1 && done <= 8 && qa('#kb-qa-table .kb-qa-row .kb-verdict.pending').length >= 2;
+      }, 15000);
+      const partial = text('#kb-qa-count');
+      assert(/^\d+ из 20 ответов$/.test(partial) && !partial.startsWith('20 '), 'счётчик: ' + partial);
+      assert(kbRowV('T01', 'rag').dataset.verdict === 'correct' && kbRowV('T10', 'rag').classList.contains('pending'), 'первая строка раньше последней');
+    });
+
+    await check('контрольные вопросы: второй прогон, пока идёт первый, получает 409 с id идущего', async () => {
+      const id = $('kb-qa-status').dataset.run;
+      const r = await factsAPI('POST', '/api/kb/evals', {});
+      assert(r.code === 409 && r.data.id === id && r.error.includes('уже идёт'), 'ответ: ' + r.code + ' ' + JSON.stringify(r.data));
+      actions.kbQaRun();
+      await until('ошибка 409 в окне', () => q('#kb-qa-error[data-code="409"]'), 8000);
+      assert(text('#kb-qa-error').includes('открыть ' + id), 'кнопка открыть: ' + text('#kb-qa-error'));
+      assert($('kb-qa-status').dataset.run === id, 'открыт другой прогон');
+    });
+
+    await check('контрольные вопросы: итог, сводка режимов рядом и вывод', async () => {
+      await until('прогон готов', () => q('#kb-qa-status[data-state="done"]') && q('#kb-qa-summary'), 20000);
+      assert(text('#kb-qa-count') === '20 из 20 ответов', 'счётчик: ' + text('#kb-qa-count'));
+      assert(!q('#kb-qa-table .kb-verdict.pending') && !$('kb-qa-run').disabled, 'остались ожидающие');
+      assert(kbRowV('T03', 'norag').dataset.verdict === 'wrong' && kbRowV('T03', 'rag').dataset.verdict === 'correct', 'T03');
+      assert(kbRowV('T10', 'rag').dataset.verdict === 'abstain' && kbRowV('T10', 'rag').textContent === 'не знаю', 'T10 rag: ' + kbRowV('T10', 'rag').textContent);
+      assert(kbRowV('T01', 'rag').textContent === '✓' && kbRowV('T01', 'norag').textContent === '✗', 'значки');
+      assert(kbRow('T01').querySelector('.kb-found[data-found]') && !kbRow('T10').querySelector('.kb-found'), 'источник найден');
+      const card = m => q(`.kb-qa-card[data-mode="${m}"] b`).textContent;
+      assert(card('rag').startsWith('8') && card('norag').startsWith('2'), 'карточки: ' + card('norag') + ' / ' + card('rag'));
+      const cell = (k, m) => q(`#kb-qa-stats tr[data-metric="${k}"] td[data-mode="${m}"]`);
+      assert(cell('correct', 'rag').textContent === '8' && cell('correct', 'rag').classList.contains('best'), 'верно rag');
+      assert(cell('confident_wrong', 'rag').classList.contains('best'), 'уверенные ошибки');
+      for (const k of ['partial', 'wrong', 'abstain', 'recall', 'agreement', 'cost']) assert(cell(k, 'rag') && cell(k, 'norag'), 'нет строки ' + k);
+      assert(cell('recall', 'norag').textContent === '—', 'recall у norag');
+      assert(cell('agreement', 'norag').textContent === '90.0 %', 'согласие: ' + cell('agreement', 'norag').textContent);
+      assert(!q('#kb-qa-stats tr[data-metric="flip_rate"]'), 'флипы при одном повторе');
+      assert(qa('#kb-qa-conclusion li').length === 5 && text('#kb-qa-conclusion').includes('С базой верно 8 из 10'), 'вывод: ' + text('#kb-qa-conclusion'));
+      assert(text('#kb-qa-summary').includes('Правило и судья разошлись: 1'), 'расхождения');
+    });
+
+    await check('контрольные вопросы: клик по строке раскрывает ответы и причины судьи', async () => {
+      click(kbRow('T03').querySelector('.kb-qa-q'));
+      await until('раскрыто', () => q('.kb-qa-detail[data-id="T03"]'));
+      const d = q('.kb-qa-detail[data-id="T03"]');
+      assert(d.previousElementSibling === kbRow('T03'), 'не под строкой');
+      assert([...d.querySelectorAll('.kb-answer')].map(x => x.dataset.mode).join(',') === 'norag,rag', 'режимы');
+      assert(d.querySelector('.kb-answer[data-mode="norag"] .kb-judge').textContent.includes('противоречит'), 'причина судьи: ' + d.textContent);
+      assert(d.querySelector('.kb-answer[data-mode="rag"] .kb-cite'), 'ссылка на фрагмент');
+      assert(d.querySelector('.kb-expect').textContent.includes('Ailurus'), 'ожидание');
+      click(kbRow('T03').querySelector('.kb-qa-q'));
+      await until('свёрнуто', () => !q('.kb-qa-detail[data-id="T03"]'));
+    });
+
+    await check('контрольные вопросы: список прогонов, открытый выделен', async () => {
+      const id = $('kb-qa-status').dataset.run;
+      const runs = qa('#kb-qa-runs .kb-qa-run');
+      assert(runs.length >= 1 && runs[0].dataset.run === id && runs[0].classList.contains('on'), 'прогоны: ' + text('#kb-qa-runs'));
+      assert(runs[0].textContent.includes('С базой (RAG) 8/10'), 'счёт: ' + runs[0].textContent);
+      const list = await factsAPI('GET', '/api/kb/evals');
+      assert(list.ok && list.data.every(x => !x.rows), 'список со строками');
+    });
+
+    await check('контрольные вопросы: окно открывается на последнем прогоне', async () => {
+      actions.closeWindow();
+      app.kb.eval = null;
+      await openKB('#kb-qa-summary');
+      assert(q('[data-kb-tab="qa"]').classList.contains('active') && qa('#kb-qa-table .kb-qa-row .kb-verdict:not(.pending)').length === 20, 'прогон не открылся');
+      await sleep(100);
+      assert(window.__xss === undefined, 'исполнился код');
     });
   };
 
@@ -1187,6 +1439,38 @@
     await sleep(200);
   };
   scenarios['shot-kb-none'] = async () => { await booted(); await openKB('#kb-off'); await sleep(200); };
+  scenarios['shot-kb-ask'] = async () => {
+    await booted();
+    await openKB();
+    await kbTabOpen('ask', '#kb-ask-pick optgroup');
+    kbPick('T03');
+    click('#kb-ask-go');
+    await until('ответы', () => q('#kb-answers') && !$('kb-ask-go').disabled, 8000);
+    $('window-body').scrollTop = 0;
+    await sleep(200);
+  };
+  scenarios['shot-kb-qa'] = async () => {
+    await booted();
+    await openKB();
+    await kbTabOpen('qa', '#kb-qa-table .kb-qa-row');
+    await kbQaStart(1, true);
+    await until('итог', () => q('#kb-qa-summary'), 20000);
+    click(kbRow('T03').querySelector('.kb-qa-q'));
+    await until('раскрыто', () => q('.kb-qa-detail[data-id="T03"]'));
+    $('window-body').scrollTop = 0;
+    await sleep(200);
+  };
+  scenarios['shot-kb-qa-summary'] = async () => {
+    await booted();
+    await openKB();
+    await kbTabOpen('qa', '#kb-qa-table .kb-qa-row');
+    if (!q('#kb-qa-summary')) {
+      await kbQaStart(1, true);
+      await until('итог', () => q('#kb-qa-summary'), 20000);
+    }
+    $('kb-qa-summary').scrollIntoView({ block: 'start' });
+    await sleep(200);
+  };
 
   async function run() {
     const name = new URLSearchParams(location.search).get('scenario') || 'main';

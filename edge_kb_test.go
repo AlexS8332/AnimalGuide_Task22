@@ -26,6 +26,8 @@ import (
 // неотвечающим эмбеддером — по адресу страницы (Referer), как facts-down.
 type edgeKB struct {
 	ok, none http.Handler
+	// rag — подставной отвечающий агент (v22): ask и evals без модели.
+	rag *edgeRAG
 }
 
 // edgeKBXSS — документ с разметкой; его URL — javascript:, ссылки быть не
@@ -88,15 +90,19 @@ func newEdgeKB(t *testing.T) *edgeKB {
 	fake := embedtest.Server(t)
 	fake.Model = embed.Hash{}.Model()
 	fake.SetHash(embed.Hash{})
-	ok := &kbapi.API{Searcher: s, Embedder: &embed.HTTP{BaseURL: fake.URL, Name: fake.Model}, Path: path}
+	questions := filepath.Join("eval", "questions.json")
+	ok := &kbapi.API{Searcher: s, Embedder: &embed.HTTP{BaseURL: fake.URL, Name: fake.Model}, Path: path, Questions: questions}
+	r := newEdgeRAG(s, qs)
+	r.wire(ok)
 
 	dead := httptest.NewServer(http.NotFoundHandler())
 	deadURL := dead.URL
 	dead.Close()
 	nonePath := filepath.Join(dir, "нет", "kb.db")
-	none := &kbapi.API{Embedder: &embed.HTTP{BaseURL: deadURL, Name: embed.DefaultModel}, Path: nonePath, Why: "базы знаний нет: " + nonePath}
+	none := &kbapi.API{Embedder: &embed.HTTP{BaseURL: deadURL, Name: embed.DefaultModel}, Path: nonePath, Why: "базы знаний нет: " + nonePath,
+		Questions: questions}
 
-	return &edgeKB{ok: edgeKBMux(ok), none: edgeKBMux(none)}
+	return &edgeKB{ok: edgeKBMux(ok), none: edgeKBMux(none), rag: r}
 }
 
 func edgeKBMux(a *kbapi.API) http.Handler {
@@ -111,6 +117,11 @@ func (e *edgeKB) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(r.Referer(), "kb-none") {
 		e.none.ServeHTTP(w, r)
 		return
+	}
+	// Опрос прогона пропускает следующий вопрос — после ответа: окно
+	// увидит новую строку следующим опросом.
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, kbapi.Prefix+"evals/") {
+		defer e.rag.poll()
 	}
 	e.ok.ServeHTTP(w, r)
 }

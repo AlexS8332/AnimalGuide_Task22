@@ -35,6 +35,32 @@ type unavailableView struct {
 
 func (a *API) handle(w http.ResponseWriter, r *http.Request) {
 	path := strings.Trim(strings.TrimPrefix(r.URL.Path, strings.TrimSuffix(Prefix, "/")), "/")
+	// v22: ответ и прогоны — свои методы и своя доступность (модель, а не
+	// только база).
+	switch {
+	case path == "ask":
+		if method(w, r, http.MethodPost) {
+			a.ask(w, r)
+		}
+		return
+	case path == "questions":
+		if method(w, r, http.MethodGet) {
+			a.questions(w)
+		}
+		return
+	case path == "evals":
+		if r.Method == http.MethodPost {
+			a.startEval(w, r)
+		} else if method(w, r, http.MethodGet, http.MethodPost) {
+			a.listEvals(w)
+		}
+		return
+	case strings.HasPrefix(path, "evals/"):
+		if method(w, r, http.MethodGet) {
+			a.getEval(w, strings.TrimPrefix(path, "evals/"))
+		}
+		return
+	}
 	switch {
 	case path == "info", path == "docs", path == "search", path == "report", strings.HasPrefix(path, "docs/"):
 	default:
