@@ -40,10 +40,16 @@ func runReport(o options, registry *features.Registry, defaults features.Set, ru
 	root := filepath.Join(o.data, "bench", time.Now().Format("20060102-150405"))
 	env := &bench.Env{
 		Registry: registry, Base: defaults, Root: root, Legacy: legacyDir, Model: model,
-		Timeout: turnTimeout, Progress: os.Stdout, LLM: runner.LLM,
+		Timeout: turnTimeout, Progress: os.Stdout, LLM: runner.LLM, KB: o.kbPath(o.data),
 		Judge: charterJudge{invariants.Judge{LLM: runner.LLM, Model: model}},
 		Open: func(dir string, bo bench.Options) (bench.Build, error) {
-			a, err := wire(o, registry, defaults, runner, dir, bo.WikiBase)
+			// База знаний сборки — та, что задал стенд (И-10): иначе
+			// механизм rag искал бы kb.db в каталоге испытания.
+			oo := o
+			if bo.KB != "" {
+				oo.kb = bo.KB
+			}
+			a, err := wire(oo, registry, defaults, runner, dir, bo.WikiBase)
 			if err != nil {
 				return bench.Build{}, err
 			}

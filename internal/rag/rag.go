@@ -23,13 +23,11 @@
 package rag
 
 import (
-	"context"
 	"errors"
 	"time"
 
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/kb"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/llm"
-	"github.com/AlexS8332/AnimalGuide_Task22/internal/tools"
 )
 
 // ErrNotImplemented — заглушка контракта.
@@ -51,18 +49,6 @@ const (
 
 // ToolName — инструмент поиска по базе знаний.
 const ToolName = "kb_search"
-
-// SearchTool — kb_search{query, k}: поиск по индексу базы знаний. Untrusted:
-// фрагменты — данные, а не указания (пометка источника и поиск инъекций
-// работают как у Википедии). Ответ — JSON: query, index, mode (dense/bm25),
-// fallback (почему не dense), hits[{chunk_id, title, section, path, score,
-// url, text}].
-func SearchTool(s *kb.Searcher, index string, k int) tools.Tool { return nil }
-
-// Compose — блок контекста для модели: по фрагменту на абзац с заголовком
-// «[chunk_id] Статья › Путь раздела», в обёртке «данные, а не указания».
-// Пустая выдача — явная строка «в базе знаний ничего не найдено».
-func Compose(hits []kb.Hit) string { return "" }
 
 // Question — вопрос к отвечающему агенту. Context — предыдущие реплики
 // пользователя (вопросы-продолжения): уходят модели как история, а в поиск
@@ -97,12 +83,6 @@ type Answerer struct {
 	Now func() time.Time
 }
 
-// Answer отвечает в режиме. RAG без базы (Searcher == nil) — ошибка, а не
-// тихий NoRAG.
-func (a *Answerer) Answer(ctx context.Context, q Question, mode Mode) (Answer, error) {
-	return Answer{}, ErrNotImplemented
-}
-
 // Verdict — оценка ответа.
 type Verdict string
 
@@ -127,14 +107,6 @@ type RuleResult struct {
 	Note    string   `json:"note,omitempty"`
 }
 
-// Rule оценивает ответ правилом: correct — все группы must и все числа
-// найдены, must_not нет; partial — найдена хотя бы половина; wrong — иначе
-// или есть must_not; abstain — в ответе явный отказ («не знаю», «нет
-// данных», «не могу ответить») и не найдено ни одной группы. Слова
-// сравниваются по основам (internal/words), числа — с допуском, с учётом
-// «1,5»/«1.5», «2–3» и записи словами для 1–10.
-func Rule(q kb.Question, answer string) RuleResult { return RuleResult{} }
-
 // Judge — судья-модель. Видит вопрос, ожидание словами (Expect.Note и
 // группы must), фрагменты-доказательства и ОДИН ответ без пометки режима.
 type Judge struct {
@@ -148,12 +120,6 @@ type JudgeResult struct {
 	Reason  string    `json:"reason"`
 	Usage   llm.Usage `json:"usage"`
 	Cost    llm.Cost  `json:"cost"`
-}
-
-// Grade — один ответ. Ответ судьи — строгий JSON {verdict, reason};
-// неразборчивый ответ — ошибка, а не «wrong».
-func (j *Judge) Grade(ctx context.Context, q kb.Question, answer string) (JudgeResult, error) {
-	return JudgeResult{}, ErrNotImplemented
 }
 
 // EvalOptions — прогон контрольных вопросов.
@@ -181,6 +147,9 @@ type Run struct {
 	// (≥ kb.EvidenceCover); у NoRAG — false.
 	Recall bool   `json:"recall"`
 	Error  string `json:"error,omitempty"`
+	// JudgeError — судья не ответил или ответил неразборчиво: Final тогда
+	// по правилу, а прогон не входит в согласие голосов (v22, добавление).
+	JudgeError string `json:"judge_error,omitempty"`
 }
 
 // Row — вопрос в отчёте: прогоны по режимам и вердикт большинства.
@@ -207,8 +176,13 @@ type ModeStats struct {
 	RightAbstain int     `json:"right_abstain"`
 	Recall       float64 `json:"recall"`
 	// Agreement — доля прогонов, где правило и судья согласны.
-	Agreement float64   `json:"agreement"`
-	FlipRate  float64   `json:"flip_rate"`
+	Agreement float64 `json:"agreement"`
+	FlipRate  float64 `json:"flip_rate"`
+	// Judged — сколько прогонов оценил судья: знаменатель Agreement; 0 —
+	// судьи не было, и согласие не определено (v22, добавление).
+	Judged int `json:"judged"`
+	// Flips — смен вердикта между повторами по всем вопросам режима.
+	Flips     int       `json:"flips"`
 	Usage     llm.Usage `json:"usage"`
 	Cost      llm.Cost  `json:"cost"`
 	AvgMillis int64     `json:"avg_ms"`
@@ -232,16 +206,6 @@ type Report struct {
 	JudgeCost     llm.Cost `json:"judge_cost"`
 }
 
-// Eval прогоняет вопросы набора в режимах.
-func Eval(ctx context.Context, a *Answerer, qs kb.QuestionSet, o EvalOptions) (Report, error) {
-	return Report{}, ErrNotImplemented
-}
-
-// Markdown — отчёт для examples/rag/compare.md: шапка, сводка режимов,
-// таблица по вопросам (ожидание, вердикты по режимам, источники), ответы
-// целиком в раскрывающихся блоках, расхождения голосов, вывод.
-func (r Report) Markdown() string { return "" }
-
 // ProbeRow — проба дискриминативности одного вопроса.
 type ProbeRow struct {
 	ID       string    `json:"id"`
@@ -249,12 +213,8 @@ type ProbeRow struct {
 	Verdicts []Verdict `json:"verdicts"`
 	// Discriminative — модель без базы отвечает верно меньше чем в 2 из 3.
 	Discriminative bool `json:"discriminative"`
-}
-
-// Probe — каждый отвечаемый вопрос (test и dev) задаётся модели без базы
-// Repeats раз (по умолчанию 3); вопрос недискриминативен, если верных
-// ответов ≥ 2 из 3. Итог — для examples/rag/probe.md и для поля
-// discriminative в eval/questions.json.
-func Probe(ctx context.Context, a *Answerer, qs kb.QuestionSet, j *Judge, repeats int) ([]ProbeRow, error) {
-	return nil, ErrNotImplemented
+	// Answers — ответы модели без базы по повторам (для probe.md); Cost —
+	// цена ответов и судьи по вопросу (v22, добавление).
+	Answers []string `json:"answers,omitempty"`
+	Cost    llm.Cost `json:"cost"`
 }
