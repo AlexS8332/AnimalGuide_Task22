@@ -43,8 +43,8 @@ func TestProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Отвечаемые test (8) и dev (18), по 3 повтора и по оценке судьи.
-	if len(rows) != 26 || fake.Calls() != 26*3*2 || rows[0].ID != "T01" || rows[8].ID != "D01" {
+	// Отвечаемые test (8) и dev (19), по 3 повтора и по оценке судьи.
+	if len(rows) != 27 || fake.Calls() != 27*3*2 || rows[0].ID != "T01" || rows[8].ID != "D01" {
 		t.Fatalf("строк %d, запросов %d", len(rows), fake.Calls())
 	}
 	if rows[0].Discriminative || !rows[1].Discriminative || len(rows[0].Verdicts) != 3 || rows[0].Verdicts[0] != Correct ||
@@ -64,7 +64,7 @@ func TestProbe(t *testing.T) {
 	// Без судьи — правило.
 	fake2 := &llmtest.Fake{Fn: func(req llm.Request) (llm.Response, error) { return llmtest.Text("Не знаю."), nil }}
 	rows, err = Probe(context.Background(), &Answerer{LLM: fake2}, qs, nil, 1)
-	if err != nil || len(rows) != 26 || fake2.Calls() != 26 || !rows[0].Discriminative {
+	if err != nil || len(rows) != 27 || fake2.Calls() != 27 || !rows[0].Discriminative {
 		t.Fatalf("без судьи: %v %d", err, fake2.Calls())
 	}
 	// Ошибка модели обрывает пробу с id вопроса.
@@ -75,9 +75,10 @@ func TestProbe(t *testing.T) {
 }
 
 // Правка eval/questions.json: только поля discriminative, формат файла
-// (массивы в строку, порядок полей) сохраняется.
+// (массивы в строку, порядок полей) сохраняется. Вход — снимок набора до первой
+// пробы (testdata/questions-v1.json): в живом файле поля уже проставлены.
 func TestSetDiscriminative(t *testing.T) {
-	raw, err := os.ReadFile(questionsFile)
+	raw, err := os.ReadFile("testdata/questions-v1.json")
 	if err != nil {
 		t.Fatal(err)
 	}

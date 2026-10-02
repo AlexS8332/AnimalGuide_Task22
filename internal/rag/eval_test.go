@@ -99,7 +99,7 @@ func TestEvalNoise(t *testing.T) {
 	var progress []string
 	rep := runEval(t, sc, EvalOptions{Repeats: 2, Judge: judge, Seed: 7, Progress: func(r Row) { progress = append(progress, r.Question.ID) }})
 
-	if strings.Join(progress, ",") != "T01,T02,T03,T04,T05,T06,T07,T08,T09,T10" || len(rep.Rows) != 10 {
+	if strings.Join(progress, ",") != "T01,T02,T03,T04,T11,T06,T07,T08,T09,T10" || len(rep.Rows) != 10 {
 		t.Fatalf("строки по мере готовности: %v", progress)
 	}
 	ra, _ := rep.statOf(RAG)
@@ -237,16 +237,16 @@ func TestEvalConclusion(t *testing.T) {
 	}
 	// Один режим — сводка по нему, без разницы.
 	rep = runEval(t, &scenario{}, EvalOptions{Modes: []Mode{NoRAG}, Splits: []string{kb.SplitDev}})
-	if len(rep.Rows) != 18 || len(rep.Stats) != 1 || !strings.HasPrefix(rep.Conclusion[0], "norag: верно 0 из 18") {
+	if len(rep.Rows) != 19 || len(rep.Stats) != 1 || !strings.HasPrefix(rep.Conclusion[0], "norag: верно 0 из 19") {
 		t.Fatalf("один режим: %d %v", len(rep.Rows), rep.Conclusion)
 	}
 }
 
 // Ошибка ответа не обрывает прогон: прогон с ошибкой вне большинства.
 func TestEvalAnswerError(t *testing.T) {
-	rep := runEval(t, &scenario{fail: "T05"}, EvalOptions{Modes: []Mode{NoRAG}})
+	rep := runEval(t, &scenario{fail: "T11"}, EvalOptions{Modes: []Mode{NoRAG}})
 	row := rep.Rows[4]
-	if row.Question.ID != "T05" || row.Runs[NoRAG][0].Error == "" || row.Majority[NoRAG] != "" {
+	if row.Question.ID != "T11" || row.Runs[NoRAG][0].Error == "" || row.Majority[NoRAG] != "" {
 		t.Fatalf("строка с ошибкой: %+v", row)
 	}
 	if st := rep.Stats[0]; st.Questions != 10 || st.Correct+st.Wrong+st.Partial+st.Abstain != 9 {

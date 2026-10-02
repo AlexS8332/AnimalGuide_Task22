@@ -1325,7 +1325,7 @@
       await openKB();
       await kbTabOpen('qa', '#kb-qa-table .kb-qa-row');
       const ids = qa('#kb-qa-table .kb-qa-row').map(r => r.dataset.id);
-      assert(ids.join(',') === 'T01,T02,T03,T04,T05,T06,T07,T08,T09,T10', 'строки: ' + ids);
+      assert(ids.join(',') === 'T01,T02,T03,T04,T11,T06,T07,T08,T09,T10', 'строки: ' + ids);
       assert(kbRow('T03').textContent.includes('MDD v2.5') && kbRow('T03').textContent.includes('conflict') && kbRow('T03').textContent.includes('mdd-carnivora'), 'строка T03: ' + kbRow('T03').textContent);
       assert(kbRow('T08').textContent.includes('после: «Где в России водится харза?»'), 'контекст T08');
       assert(kbRow('T10').querySelector('.kb-qa-exp').textContent.includes('в базе нет'), 'ожидание T10');
@@ -1366,7 +1366,7 @@
       assert(kbRowV('T01', 'rag').textContent === '✓' && kbRowV('T01', 'norag').textContent === '✗', 'значки');
       assert(kbRow('T01').querySelector('.kb-found[data-found]') && !kbRow('T10').querySelector('.kb-found'), 'источник найден');
       const card = m => q(`.kb-qa-card[data-mode="${m}"] b`).textContent;
-      assert(card('rag').startsWith('8') && card('norag').startsWith('2'), 'карточки: ' + card('norag') + ' / ' + card('rag'));
+      assert(card('rag').startsWith('8') && card('norag').startsWith('1'), 'карточки: ' + card('norag') + ' / ' + card('rag'));
       const cell = (k, m) => q(`#kb-qa-stats tr[data-metric="${k}"] td[data-mode="${m}"]`);
       assert(cell('correct', 'rag').textContent === '8' && cell('correct', 'rag').classList.contains('best'), 'верно rag');
       assert(cell('confident_wrong', 'rag').classList.contains('best'), 'уверенные ошибки');

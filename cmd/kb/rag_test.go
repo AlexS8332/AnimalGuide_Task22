@@ -166,7 +166,7 @@ func TestQA(t *testing.T) {
 	n := f.count()
 	code, out, _ = runKB("qa", "-modes", "norag", "-splits", "dev", "-judge=false", "-questions", "../../eval/questions.json",
 		"-db", filepath.Join(dir, "nope.db"), "-out", filepath.Join(dir, "dev.md"))
-	if code != exitOK || f.count()-n != 18 || !strings.Contains(out, "norag: верно 0 из 18") {
+	if code != exitOK || f.count()-n != 19 || !strings.Contains(out, "norag: верно 0 из 19") {
 		t.Fatalf("norag dev: %d %d\n%s", code, f.count()-n, out)
 	}
 	// Поиск откатился на BM25 — закоммиченный отчёт по умолчанию не
@@ -200,8 +200,8 @@ func TestProbe(t *testing.T) {
 		t.Fatalf("probe: %d\n%s\n%s", code, out, errOut)
 	}
 	// Модель «знает» вопросы о MDD: T03, T06, D07, D08.
-	if !strings.Contains(out, "Вопросов 26, недискриминативных 4: T03, T06, D07, D08") || !strings.Contains(out, "Поле discriminative записано") ||
-		f.count() != 26*2 {
+	if !strings.Contains(out, "Вопросов 27, недискриминативных 4: T03, T06, D07, D08") || !strings.Contains(out, "Поле discriminative записано") ||
+		f.count() != 27*2 {
 		t.Fatalf("probe: %d\n%s", f.count(), out)
 	}
 	if raw, err := os.ReadFile(md); err != nil || !strings.Contains(string(raw), "недискриминативных 4 (T03, T06, D07, D08)") {
