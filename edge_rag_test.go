@@ -380,10 +380,16 @@ func edgeStats(rows []rag.Row, modes []rag.Mode) ([]rag.ModeStats, []string, llm
 				if v == rag.Abstain {
 					s.RightAbstain++
 				} else {
-					s.ConfidentWrong++
+					s.AnsweredUnanswerable++
 				}
 			} else if v == rag.Wrong {
 				s.ConfidentWrong++
+			}
+			if d := r.Question.Discriminative; d != nil && *d {
+				s.Discriminative++
+				if v == rag.Correct {
+					s.DiscriminativeCorrect++
+				}
 			}
 			if r.Flips[m] > 0 {
 				flips++

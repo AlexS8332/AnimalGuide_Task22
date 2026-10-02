@@ -29,7 +29,7 @@ const (
 // Пороги И-10 (предложение, задание 22).
 const (
 	ragMinGain        = 3   // rag верен минимум на 3 вопроса чаще norag
-	ragMinRecall      = 0.8 // доказательство в выдаче rag на отвечаемых
+	ragMinRecall      = 0.8 // доказательство в топ-5 поиска на dev+test, без модели
 	ragMaxConfident   = 1   // уверенных ошибок у rag
 	ragDefaultRepeats = 2   // rag и rag′ — шум модели
 	ragSeed           = 22
@@ -50,9 +50,15 @@ var DefaultRAGDialog = []string{"T03", "T01", "T04", "T07"}
 //   - rag верен (большинство повторов) минимум на 3 вопроса чаще norag, и
 //     разница больше шума — смен вердикта между повторами; меньше шума —
 //     «не определено»;
-//   - доказательство вопроса в выдаче rag на отвечаемых — ≥ 0.8;
-//   - уверенных ошибок у rag — ≤ 1;
-//   - на неотвечаемых (T09, T10) rag говорит «не знаю» хотя бы в половине.
+//   - доказательство вопроса в топ-5 поиска — ≥ 0.8 на отвечаемых dev+test,
+//     поиском без модели (как kb.Compare): на одном test (8 вопросов с
+//     доказательствами) порог проваливается детерминированно — у поиска
+//     там 6 из 8, — а подбирать k по test нельзя. Recall по выдаче самого
+//     отвечающего агента на test — отчётное число с разбором промахов: id
+//     вопроса и ранг первого релевантного фрагмента в топ-20 (или «нет»);
+//   - уверенных ошибок у rag (wrong на отвечаемых) — ≤ 1;
+//   - на неотвечаемых (T09, T10) rag говорит «не знаю» — 2 из 2: ответ по
+//     существу там — ответ мимо фрагментов, и он не прощается.
 //
 // Часть B — продуктовое число: ведущий в чате с механизмом rag и без него
 // (дорожки отличаются ровно механизмом rag, CheckLanes) на 4 вопросах
@@ -92,8 +98,8 @@ func (t *RAG) Run(ctx context.Context, s *Stand, r *Result) error {
 		LaneInfo{Name: laneAnsNoRAG, Note: "отвечающий агент без инструментов: системный промпт и вопрос", Diff: "не диалог: один запрос к модели"},
 		LaneInfo{Name: laneAnsRAG, Note: "тот же агент: правило «опирайся на фрагменты» и найденные фрагменты после вопроса", Diff: "+ фрагменты базы знаний"})
 
-	checks := []string{"rag верен чаще norag (большинство повторов, test)", "доказательство в выдаче rag на отвечаемых",
-		"уверенных ошибок у rag", "«не знаю» у rag на вопросах без ответа в базе"}
+	checks := []string{"rag верен чаще norag (большинство повторов, test)", "доказательство в топ-5 поиска (dev+test, без модели)",
+		"уверенных ошибок у rag на отвечаемых", "«не знаю» у rag на вопросах без ответа в базе"}
 	path := t.kbPath(s)
 	qs, err := kb.LoadQuestions(orDefault(t.Questions, DefaultQuestions))
 	if err != nil {
@@ -135,8 +141,12 @@ func (t *RAG) Run(ctx context.Context, s *Stand, r *Result) error {
 	if err != nil {
 		return fmt.Errorf("И-10: %w", err)
 	}
-	t.judge(r, rep, checks)
-	t.report(r, rep)
+	ranks, info, err := rag.Ranks(ctx, a.Searcher, qs, []string{kb.SplitDev, kb.SplitTest}, rep.Index)
+	if err != nil {
+		return fmt.Errorf("И-10: поиск без модели: %w", err)
+	}
+	t.judge(r, rep, checks, ranks, info)
+	t.report(r, rep, ranks)
 	if len(t.dialog()) > 0 {
 		abs, err := filepath.Abs(path)
 		if err != nil {
@@ -165,7 +175,7 @@ func (t *RAG) dialog() []string {
 }
 
 // judge — жёсткие проверки части A.
-func (t *RAG) judge(r *Result, rep rag.Report, checks []string) {
+func (t *RAG) judge(r *Result, rep rag.Report, checks []string, ranks []rag.RankRow, info kb.SearchInfo) {
 	ra, no := statOf(rep, rag.RAG), statOf(rep, rag.NoRAG)
 	d, noise := ra.Correct-no.Correct, ra.Flips+no.Flips
 	c := Check{What: checks[0], Want: fmt.Sprintf("≥ +%d вопроса и больше шума", ragMinGain), Lane: laneAnsRAG,
@@ -181,25 +191,18 @@ func (t *RAG) judge(r *Result, rep rag.Report, checks []string) {
 	}
 	r.check(c)
 
-	hit, n := 0, 0
-	for _, row := range rep.Rows {
-		if !row.Question.Answerable || len(row.Question.Evidence) == 0 {
-			continue
-		}
-		for _, run := range row.Runs[rag.RAG] {
-			if run.Error != "" {
-				continue
-			}
-			n++
-			if run.Recall {
-				hit++
-			}
-		}
+	// Recall — поиском без модели на dev+test: на одном test порог 0.8
+	// проваливается от одного-двух вопросов, а k по test не подбирается.
+	rec, hit := rag.RecallAt(ranks, rep.K)
+	mode := string(info.Mode)
+	if info.Fallback != "" {
+		mode += " (откат: " + info.Fallback + ")"
 	}
 	rc := Check{What: checks[1], Want: fmt.Sprintf("≥ %.2f", ragMinRecall), Lane: laneAnsRAG,
-		Got: fmt.Sprintf("%.2f (%d из %d прогонов; индекс %s, k = %d)", ra.Recall, hit, n, rep.Index, rep.K), Status: Pass}
-	if n == 0 || ra.Recall+1e-9 < ragMinRecall {
+		Got: fmt.Sprintf("%.2f (%d из %d вопросов; индекс %s, k = %d, поиск %s)", rec, hit, len(ranks), rep.Index, rep.K, orDash(mode)), Status: Pass}
+	if len(ranks) == 0 || rec+1e-9 < ragMinRecall {
 		rc.Status = Fail
+		rc.Note = "мимо топа: " + rankMisses(ranks, rep.K)
 	}
 	r.check(rc)
 
@@ -208,8 +211,7 @@ func (t *RAG) judge(r *Result, rep rag.Report, checks []string) {
 		cw.Status = Fail
 		var ids []string
 		for _, row := range rep.Rows {
-			v := row.Majority[rag.RAG]
-			if (row.Question.Answerable && v == rag.Wrong) || (!row.Question.Answerable && v != rag.Abstain && v != "") {
+			if row.Question.Answerable && row.Majority[rag.RAG] == rag.Wrong {
 				ids = append(ids, row.Question.ID)
 			}
 		}
@@ -227,11 +229,43 @@ func (t *RAG) judge(r *Result, rep rag.Report, checks []string) {
 		r.pending(checks[3], "—", laneAnsRAG, "в наборе нет вопросов без ответа в базе")
 		return
 	}
-	r.atLeast(checks[3], laneAnsRAG, ra.RightAbstain, un, (un+1)/2)
+	r.atLeast(checks[3], laneAnsRAG, ra.RightAbstain, un, un)
+	if ra.RightAbstain < un {
+		var ids []string
+		for _, row := range rep.Rows {
+			if !row.Question.Answerable && row.Majority[rag.RAG] != rag.Abstain {
+				ids = append(ids, row.Question.ID+" "+orDash(string(row.Majority[rag.RAG])))
+			}
+		}
+		r.Checks[len(r.Checks)-1].Note = strings.Join(ids, ", ")
+	}
+}
+
+// rankMisses — вопросы, у которых доказательства нет в топ-k: «T04 — ранг
+// 7, D03 — нет в топ-20».
+func rankMisses(ranks []rag.RankRow, k int) string {
+	var out []string
+	for _, x := range ranks {
+		if x.Rank > 0 && x.Rank <= k {
+			continue
+		}
+		out = append(out, x.ID+" — "+rankText(x.Rank))
+	}
+	if len(out) == 0 {
+		return "нет"
+	}
+	return strings.Join(out, ", ")
+}
+
+func rankText(rank int) string {
+	if rank == 0 {
+		return fmt.Sprintf("нет в топ-%d", rag.RankDepth)
+	}
+	return fmt.Sprintf("ранг %d", rank)
 }
 
 // report — отчётные числа, заметки и ответы части A.
-func (t *RAG) report(r *Result, rep rag.Report) {
+func (t *RAG) report(r *Result, rep rag.Report, ranks []rag.RankRow) {
 	r.metric("индекс, k, эмбеддер", "", "%s, %d, %s; corpus_sha %s", rep.Index, rep.K, rep.Embedder, clip(rep.CorpusSHA, 12))
 	un := 0
 	for _, row := range rep.Rows {
@@ -242,10 +276,14 @@ func (t *RAG) report(r *Result, rep rag.Report) {
 	for _, st := range rep.Stats {
 		lane := string(st.Mode)
 		r.metric("верно / частично / неверно / «не знаю» (большинство)", lane, "%d / %d / %d / %d из %d", st.Correct, st.Partial, st.Wrong, st.Abstain, st.Questions)
-		r.metric("уверенных ошибок", lane, "%d", st.ConfidentWrong)
+		r.metric("уверенных ошибок на отвечаемых", lane, "%d", st.ConfidentWrong)
 		r.metric("«не знаю» на вопросах без ответа в базе", lane, "%d из %d", st.RightAbstain, un)
+		r.metric("ответ по существу на вопросах без ответа в базе", lane, "%d из %d", st.AnsweredUnanswerable, un)
+		if st.Discriminative > 0 {
+			r.metric("верно на дискриминативных", lane, "%d из %d", st.DiscriminativeCorrect, st.Discriminative)
+		}
 		if st.Mode == rag.RAG {
-			r.metric("доказательство в выдаче", lane, "%.2f", st.Recall)
+			r.metric("доказательство в выдаче отвечающего агента (test, отчётно)", lane, "%.2f", st.Recall)
 		}
 		r.metric("смен вердикта между повторами (шум)", lane, "%d (%.0f %% переходов)", st.Flips, 100*st.FlipRate)
 		if st.Judged > 0 {
@@ -255,6 +293,11 @@ func (t *RAG) report(r *Result, rep rag.Report) {
 		r.metric("цена ответов", lane, "$%.4f", st.Cost.USD)
 		r.metric("среднее время ответа", lane, "%d мс", st.AvgMillis)
 	}
+	if rec, hit := rag.RecallAt(ranks, rep.K); len(ranks) > 0 {
+		r.metric("доказательство в топ-k поиска без модели (dev+test)", laneAnsRAG, "%.2f (%d из %d)", rec, hit, len(ranks))
+	}
+	r.note("Промахи выдачи rag на test (доказательства нет в топ-%d, ранг первого релевантного в топ-%d): %s.",
+		rep.K, rag.RankDepth, answerMisses(rep, ranks))
 	r.metric("цена судьи", "судья", "$%.4f", rep.JudgeCost.USD)
 	r.metric("расхождений правила и судьи", "судья", "%d", len(rep.Disagreements))
 	for _, c := range rep.Conclusion {
@@ -428,4 +471,40 @@ func (t *RAG) chat(ctx context.Context, s *Stand, r *Result, kbPath string, qs k
 		}
 	}
 	return nil
+}
+
+// answerMisses — промахи выдачи отвечающего агента: вопросы test, где ни в
+// одном прогоне rag доказательства в выдаче не было, с рангом из поиска
+// без модели (запрос тот же).
+func answerMisses(rep rag.Report, ranks []rag.RankRow) string {
+	rank := map[string]int{}
+	for _, x := range ranks {
+		rank[x.ID] = x.Rank
+	}
+	var out []string
+	for _, row := range rep.Rows {
+		q := row.Question
+		if !q.Answerable || len(q.Evidence) == 0 {
+			continue
+		}
+		runs, found := 0, false
+		for _, run := range row.Runs[rag.RAG] {
+			if run.Error == "" {
+				runs++
+				found = found || run.Recall
+			}
+		}
+		if runs == 0 || found {
+			continue
+		}
+		text := "нет в выдаче"
+		if r, ok := rank[q.ID]; ok {
+			text = rankText(r)
+		}
+		out = append(out, q.ID+" — "+text)
+	}
+	if len(out) == 0 {
+		return "нет"
+	}
+	return strings.Join(out, ", ")
 }

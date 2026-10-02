@@ -35,8 +35,8 @@ func (r Report) Markdown() string {
 		b.WriteString("- " + c + "\n")
 	}
 	b.WriteString("\n## Сводка режимов\n\n")
-	b.WriteString("| режим | вопросов | верно | частично | неверно | «не знаю» | уверенных ошибок | «не знаю» без ответа в базе | доказательство в выдаче | согласие правила и судьи | смен вердикта | токены (кэш) | цена | мс на ответ |\n")
-	b.WriteString("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+	b.WriteString("| режим | вопросов | верно | частично | неверно | «не знаю» | уверенных ошибок на отвечаемых | «не знаю» без ответа в базе | ответ по существу без ответа в базе | верно на дискриминативных | доказательство в выдаче | согласие правила и судьи | смен вердикта | токены (кэш) | цена | мс на ответ |\n")
+	b.WriteString("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 	un := r.unanswerable()
 	for _, s := range r.Stats {
 		recall, agree := "—", "—"
@@ -50,9 +50,9 @@ func (r Report) Markdown() string {
 		if r.Repeats > 1 {
 			flips = fmt.Sprintf("%d (%.0f %%)", s.Flips, 100*s.FlipRate)
 		}
-		fmt.Fprintf(&b, "| `%s` | %d | %d | %d | %d | %d | %d | %d из %d | %s | %s | %s | %d (%d) | %s | %d |\n",
+		fmt.Fprintf(&b, "| `%s` | %d | %d | %d | %d | %d | %d | %d из %d | %d из %d | %d из %d | %s | %s | %s | %d (%d) | %s | %d |\n",
 			s.Mode, s.Questions, s.Correct, s.Partial, s.Wrong, s.Abstain, s.ConfidentWrong, s.RightAbstain, un,
-			recall, agree, flips, s.Usage.Prompt+s.Usage.Completion, s.Usage.CacheHit, usd(s.Cost), s.AvgMillis)
+			s.AnsweredUnanswerable, un, s.DiscriminativeCorrect, s.Discriminative, recall, agree, flips, s.Usage.Prompt+s.Usage.Completion, s.Usage.CacheHit, usd(s.Cost), s.AvgMillis)
 	}
 
 	b.WriteString("\n## Вопросы\n\n")

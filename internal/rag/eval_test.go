@@ -105,11 +105,12 @@ func TestEvalNoise(t *testing.T) {
 	ra, _ := rep.statOf(RAG)
 	no, _ := rep.statOf(NoRAG)
 	if ra.Questions != 10 || ra.Correct != 7 || ra.Partial != 1 || ra.Abstain != 2 || ra.RightAbstain != 2 ||
-		ra.ConfidentWrong != 0 || ra.Flips != 0 || ra.Judged != 20 {
+		ra.ConfidentWrong != 0 || ra.AnsweredUnanswerable != 0 || ra.Flips != 0 || ra.Judged != 20 ||
+		ra.Discriminative != 8 || no.Discriminative != 8 || no.DiscriminativeCorrect != 1 {
 		t.Fatalf("rag: %+v", ra)
 	}
 	// norag: «не знаю» и неверное число — ничья решается в худшую сторону.
-	if no.Correct != 1 || no.Wrong != 9 || no.Abstain != 0 || no.ConfidentWrong != 9 || no.RightAbstain != 0 ||
+	if no.Correct != 1 || no.Wrong != 9 || no.Abstain != 0 || no.ConfidentWrong != 7 || no.AnsweredUnanswerable != 2 || no.RightAbstain != 0 ||
 		no.Flips != 7 || no.FlipRate != 0.7 || no.Recall != 0 {
 		t.Fatalf("norag: %+v", no)
 	}
@@ -126,13 +127,15 @@ func TestEvalNoise(t *testing.T) {
 	// +6 не больше шума 7 — не засчитано.
 	c := strings.Join(rep.Conclusion, "\n")
 	for _, want := range []string{"rag 7 из 10, norag 1 из 10 — разница +6", "не больше шума", "rag 0, norag 7", "не засчитана",
-		"Уверенных ошибок: norag 9, rag 0", "«Не знаю» на вопросах без ответа в базе: norag 0 из 2, rag 2 из 2",
+		"Уверенных ошибок на отвечаемых вопросах (wrong): norag 7, rag 0",
+		"Вопросы без ответа в базе (2): «не знаю» — norag 0, rag 2; ответ по существу — norag 2, rag 0",
+		"Дискриминативные вопросы (без базы модель их не знает, 8): верно rag 7, norag 1 — разница +6",
 		"Согласие правила и судьи: 95 % из 40 прогонов (расхождений 2)", "судья $"} {
 		if !strings.Contains(c, want) {
 			t.Errorf("вывод без %q:\n%s", want, c)
 		}
 	}
-	if len(rep.Conclusion) < 3 || len(rep.Conclusion) > 5 {
+	if len(rep.Conclusion) != 7 {
 		t.Fatalf("строк вывода %d", len(rep.Conclusion))
 	}
 	if rep.Model != llm.DefaultModel || rep.Index != DefaultIndex || rep.K != DefaultK || rep.Embedder != "hash-256" ||
@@ -308,5 +311,41 @@ func TestMajority(t *testing.T) {
 		if v != c.want || f != c.flips {
 			t.Errorf("%v: %s/%d, ждали %s/%d", c.runs, v, f, c.want, c.flips)
 		}
+	}
+}
+
+// Ranks — поиск без модели тем же запросом, что у отвечающего агента: ранг
+// ≤ k ровно тогда, когда в выдаче k фрагментов есть доказательство.
+func TestRanks(t *testing.T) {
+	s, qs := searcher(t), questions(t)
+	ctx := context.Background()
+	rows, info, err := Ranks(ctx, s, qs, []string{kb.SplitDev, kb.SplitTest}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 27 || info.Mode != kb.Dense || info.Index != DefaultIndex {
+		t.Fatalf("строк %d, поиск %+v", len(rows), info)
+	}
+	ev := &evidenceIndex{s: s, texts: map[string]string{}}
+	byID := map[string]kb.Question{}
+	for _, q := range qs.Questions {
+		byID[q.ID] = q
+	}
+	for _, r := range rows {
+		q := byID[r.ID]
+		hits, _, err := s.Search(ctx, QuestionOf(q).Query(), kb.SearchOptions{Index: DefaultIndex, K: DefaultK})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := r.Rank > 0 && r.Rank <= DefaultK; got != ev.covered(ctx, q, hits) || r.Split != q.Split {
+			t.Errorf("%s: ранг %d, в выдаче k=%d — %v", r.ID, r.Rank, DefaultK, !got)
+		}
+	}
+	rec, hit := RecallAt(rows, DefaultK)
+	if hit > len(rows) || rec != float64(hit)/float64(len(rows)) {
+		t.Fatalf("recall %v %d", rec, hit)
+	}
+	if _, _, err := Ranks(ctx, nil, qs, []string{kb.SplitTest}, ""); err == nil {
+		t.Fatal("без базы")
 	}
 }

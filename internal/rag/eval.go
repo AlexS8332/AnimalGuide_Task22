@@ -199,16 +199,15 @@ func majority(q kb.Question, runs []Run) (Verdict, int) {
 	return best, flips
 }
 
-// confidentWrong — неверно и без оговорок: wrong у отвечаемого, любой
-// ответ по существу у неотвечаемого.
+// confidentWrong — уверенная ошибка на отвечаемом: wrong.
 func confidentWrong(q kb.Question, v Verdict) bool {
-	if v == "" {
-		return false
-	}
-	if !q.Answerable {
-		return v != Abstain
-	}
-	return v == Wrong
+	return q.Answerable && v == Wrong
+}
+
+// answeredUnanswerable — ответ по существу на неотвечаемом: всё, кроме
+// «не знаю».
+func answeredUnanswerable(q kb.Question, v Verdict) bool {
+	return !q.Answerable && v != "" && v != Abstain
 }
 
 // modeStats — сводка режима по строкам.
@@ -239,6 +238,15 @@ func modeStats(m Mode, rows []Row) ModeStats {
 		}
 		if !q.Answerable && v == Abstain {
 			st.RightAbstain++
+		}
+		if answeredUnanswerable(q, v) {
+			st.AnsweredUnanswerable++
+		}
+		if q.Discriminative != nil && *q.Discriminative {
+			st.Discriminative++
+			if v == Correct {
+				st.DiscriminativeCorrect++
+			}
 		}
 		st.Flips += row.Flips[m]
 		valid := 0
@@ -352,18 +360,22 @@ func conclude(r Report) []string {
 		out = append(out, fmt.Sprintf("Доказательство в выдаче rag (индекс %s, k = %d): %.0f %% прогонов на отвечаемых вопросах.",
 			r.Index, r.K, 100*ra.Recall))
 	}
-	var cw, ab []string
+	if hasRAG && hasNo && ra.Discriminative > 0 {
+		out = append(out, fmt.Sprintf("Дискриминативные вопросы (без базы модель их не знает, %d): верно rag %d, norag %d — разница %+d (на них разница — вклад базы, а не общих знаний модели).",
+			ra.Discriminative, ra.DiscriminativeCorrect, no.DiscriminativeCorrect, ra.DiscriminativeCorrect-no.DiscriminativeCorrect))
+	}
+	var cw, ab, au []string
 	for _, s := range r.Stats {
 		cw = append(cw, fmt.Sprintf("%s %d", s.Mode, s.ConfidentWrong))
-		if un > 0 {
-			ab = append(ab, fmt.Sprintf("%s %d из %d", s.Mode, s.RightAbstain, un))
-		}
+		ab = append(ab, fmt.Sprintf("%s %d", s.Mode, s.RightAbstain))
+		au = append(au, fmt.Sprintf("%s %d", s.Mode, s.AnsweredUnanswerable))
 	}
-	line := "Уверенных ошибок: " + strings.Join(cw, ", ") + "."
-	if len(ab) > 0 {
-		line += " «Не знаю» на вопросах без ответа в базе: " + strings.Join(ab, ", ") + "."
+	out = append(out, "Уверенных ошибок на отвечаемых вопросах (wrong): "+strings.Join(cw, ", ")+".")
+	if un > 0 {
+		out = append(out, fmt.Sprintf("Вопросы без ответа в базе (%d): «не знаю» — %s; ответ по существу — %s. "+
+			"У norag это ответ из памяти модели (база его не подтверждает и не опровергает), у rag — ответ мимо фрагментов.",
+			un, strings.Join(ab, ", "), strings.Join(au, ", ")))
 	}
-	out = append(out, line)
 	judged, agree := 0, 0.0
 	var costs []string
 	for _, s := range r.Stats {
@@ -452,4 +464,69 @@ func (x *evidenceIndex) covered(ctx context.Context, q kb.Question, hits []kb.Hi
 		}
 	}
 	return false
+}
+
+// RankDepth — глубина поиска для разбора промахов выдачи: ранг первого
+// релевантного фрагмента в топ-20 (как searchDepth в kb.Compare).
+const RankDepth = 20
+
+// RankRow — ранг первого фрагмента, покрывающего доказательство вопроса, в
+// поиске на глубину RankDepth; 0 — в топе его нет.
+type RankRow struct {
+	ID    string `json:"id"`
+	Split string `json:"split"`
+	Rank  int    `json:"rank"`
+}
+
+// Ranks — поиск без модели: для каждого отвечаемого вопроса с
+// доказательствами из наборов splits — ранг первого релевантного фрагмента
+// (то же правило покрытия, что в kb.Compare и Run.Recall). Запрос — тот же,
+// что у отвечающего агента (Question.Query), поэтому промах Answerer'а
+// разбирается этим же рангом. Второе значение — режим поиска (с откатом).
+func Ranks(ctx context.Context, s *kb.Searcher, qs kb.QuestionSet, splits []string, index string) ([]RankRow, kb.SearchInfo, error) {
+	if s == nil {
+		return nil, kb.SearchInfo{}, errors.New("нет базы знаний")
+	}
+	ev := &evidenceIndex{s: s, texts: map[string]string{}}
+	var out []RankRow
+	var info kb.SearchInfo
+	for _, sp := range splits {
+		for _, q := range qs.Split(sp) {
+			// Как в kb.Compare: в счёт — вопросы, чьи доказательства нашлись
+			// в тексте документов базы.
+			if !q.Answerable || len(ev.of(ctx, q)) == 0 {
+				continue
+			}
+			hits, si, err := s.Search(ctx, QuestionOf(q).Query(), kb.SearchOptions{Index: orIndex(index), K: RankDepth})
+			if err != nil {
+				return out, info, fmt.Errorf("%s: %w", q.ID, err)
+			}
+			if info.Mode == "" || si.Fallback != "" {
+				info = si
+			}
+			row := RankRow{ID: q.ID, Split: sp}
+			for i, h := range hits {
+				if ev.covered(ctx, q, []kb.Hit{h}) {
+					row.Rank = i + 1
+					break
+				}
+			}
+			out = append(out, row)
+		}
+	}
+	return out, info, nil
+}
+
+// RecallAt — доля строк с рангом 1…k и их число.
+func RecallAt(rows []RankRow, k int) (float64, int) {
+	hit := 0
+	for _, r := range rows {
+		if r.Rank > 0 && r.Rank <= k {
+			hit++
+		}
+	}
+	if len(rows) == 0 {
+		return 0, 0
+	}
+	return float64(hit) / float64(len(rows)), hit
 }
