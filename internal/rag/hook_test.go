@@ -60,7 +60,8 @@ func TestHookBefore(t *testing.T) {
 		t.Fatalf("вызов кодом: %+v", tr.Request.Preload)
 	}
 	if !tr.Request.Features.On(features.RAG) || len(rec.Events) != 1 || rec.Events[0].Kind != agent.EventMechanism ||
-		rec.Events[0].Mechanism != "rag" || rec.Events[0].Title != "база знаний: kb_search кодом до первого запроса (индекс structure, k 3)" {
+		rec.Events[0].Mechanism != "rag" || rec.Events[0].Title != "база знаний: заказан вызов kb_search кодом до первого запроса ведущего (индекс structure, k 3)" ||
+		!strings.Contains(rec.Events[0].Detail, "вызова kb_search не будет") {
 		t.Fatalf("журнал: %+v", rec.Events)
 	}
 	if err := h.After(context.Background(), tr); err != nil {
