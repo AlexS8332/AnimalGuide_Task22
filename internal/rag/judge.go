@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -14,9 +15,11 @@ import (
 )
 
 // judgeSystem — системный промпт судьи. Судья слеп к режиму: он не знает,
-// были ли у ответа фрагменты базы, и не видит второго ответа. Ссылки
-// [chunk_id] он не оценивает — иначе ответ rag узнавался бы по ним и
-// получал бы плюс (или минус) за форму, а не за содержание. Неотвечаемые
+// были ли у ответа фрагменты базы, и не видит второго ответа. Ссылок
+// [chunk_id] и слов «в базе знаний», «во фрагментах» он тоже не видит —
+// их вырезает код до запроса (Blind): иначе ответ rag узнавался бы по ним
+// и получал бы плюс (или минус) за форму, а не за содержание. Просить
+// судью «не оценивай ссылки» мало — он их всё равно видит. Неотвечаемые
 // вопросы оговорены отдельно и жёстко: «по общим данным фосса весит 7–12
 // кг» звучит правдоподобно, но база этого не содержит, и такой ответ —
 // уверенная ошибка, а не частичный успех.
@@ -30,7 +33,7 @@ const judgeSystem = `Ты — строгий проверяющий ответо
 
 Если вопрос помечен «ответа в базе нет», правильный исход — abstain: ответ говорит, что данных нет. Любой ответ по существу — с числом, фактом или оценкой «обычно», «по общим данным», «в среднем» — это wrong, даже если звучит правдоподобно и даже если рядом есть оговорка.
 
-Ссылки на фрагменты вида [manul/structure/004] не оценивай ни в плюс, ни в минус. Лишние верные подробности оценку не снижают, выдуманные — снижают. Не додумывай за ответ: чего в нём нет, того нет.
+Лишние верные подробности оценку не снижают, выдуманные — снижают. Не додумывай за ответ: чего в нём нет, того нет.
 
 Ответь строго одним JSON-объектом без текста вокруг:
 {"verdict": "correct|partial|wrong|abstain", "reason": "одно-два предложения по-русски: что совпало, чего не хватает или что неверно"}`
@@ -94,7 +97,32 @@ func judgeUser(q kb.Question, answer string) string {
 	return b.String()
 }
 
-// Grade — один ответ. Ответ судьи — строгий JSON {verdict, reason};
+// refBlock — ссылки на фрагменты в скобках: «[manul/structure/004]»,
+// «[a/structure/001, b/fixed/002]» вместе с пробелами перед ними.
+var refBlock = regexp.MustCompile(`[ \t\x{a0}]*\[(?:[^\[\]]*?` + chunkRef.String() + `)+[^\[\]]*\]`)
+
+// sourceWords — как ответ называет источник: «в базе знаний», «во
+// фрагментах», «в приведённых фрагментах». Ответ norag так не говорит, и по
+// этим словам судья узнавал бы режим.
+var sourceWords = regexp.MustCompile(`(?i)(в|во) (?:базе знаний|фрагментах|привед[её]нных фрагментах|предоставленных фрагментах|данных фрагментах)`)
+
+// Blind — ответ для судьи без примет режима: ссылки [chunk_id] вырезаны
+// (и голые «manul/structure/004» тоже), «в базе знаний» и «во фрагментах»
+// заменены на «в источниках». Правило оценивает исходный ответ: ссылки
+// оно и так не считает числами.
+func Blind(answer string) string {
+	s := refBlock.ReplaceAllString(answer, "")
+	s = chunkRef.ReplaceAllString(s, "")
+	s = sourceWords.ReplaceAllStringFunc(s, func(m string) string {
+		if strings.HasPrefix(m, "В") {
+			return "В источниках"
+		}
+		return "в источниках"
+	})
+	return strings.TrimSpace(s)
+}
+
+// Grade — один ответ; судья получает его через Blind. Ответ судьи — строгий JSON {verdict, reason};
 // неразборчивый ответ — ошибка, а не «wrong».
 func (j *Judge) Grade(ctx context.Context, q kb.Question, answer string) (JudgeResult, error) {
 	if j == nil || j.LLM == nil {
@@ -106,7 +134,7 @@ func (j *Judge) Grade(ctx context.Context, q kb.Question, answer string) (JudgeR
 	}
 	resp, err := j.LLM.Chat(ctx, llm.Request{Model: model, Temperature: 0, Messages: []llm.Message{
 		{Role: llm.RoleSystem, Content: judgeSystem},
-		{Role: llm.RoleUser, Content: judgeUser(q, answer)},
+		{Role: llm.RoleUser, Content: judgeUser(q, Blind(answer))},
 	}})
 	if err != nil {
 		return JudgeResult{}, fmt.Errorf("судья: %w", err)
