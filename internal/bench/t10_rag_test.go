@@ -69,6 +69,11 @@ func (m *ragModel) chat(req llm.Request) (llm.Response, error) {
 		if sys == rag.System(rag.RAG) {
 			mode = rag.RAG
 		}
+		// Вопрос — после «Вопрос: », если перед ним реплики, и до
+		// фрагментов (после пустой строки).
+		if _, after, ok := strings.Cut(user, "\n\nВопрос: "); ok && strings.HasPrefix(user, "Предыдущие реплики пользователя:") {
+			user = after
+		}
 		text, _, _ := strings.Cut(user, "\n\n")
 		for _, q := range m.qs.Questions {
 			if q.Q == text {
@@ -124,19 +129,31 @@ func TestRAGTrial(t *testing.T) {
 	if gain.Status != Pass || !strings.Contains(gain.Got, "rag 8, norag 0 из 10 (+8)") {
 		t.Fatalf("разница: %+v", gain)
 	}
-	if c := find(t, res, "уверенных ошибок у rag", ""); c.Status != Pass || c.Got != "0" {
+	if c := find(t, res, "уверенных ошибок у rag на отвечаемых", ""); c.Status != Pass || c.Got != "0" {
 		t.Fatalf("уверенные ошибки: %+v", c)
 	}
-	if c := find(t, res, "«не знаю» у rag на вопросах без ответа в базе", ""); c.Status != Pass || c.Got != "2 из 2" {
+	if c := find(t, res, "«не знаю» у rag на вопросах без ответа в базе", ""); c.Status != Pass || c.Got != "2 из 2" || c.Want != "2 из 2" {
 		t.Fatalf("«не знаю»: %+v", c)
 	}
-	// Recall — по выдаче hash-поиска; проверка сходится со своим числом.
-	rc := find(t, res, "доказательство в выдаче rag на отвечаемых", "")
-	if !strings.Contains(rc.Got, "из 16 прогонов; индекс structure, k = 5") || (rc.Status == Pass) != (metric(res, "доказательство в выдаче", "rag") >= "0.80") {
-		t.Fatalf("recall: %+v / %s", rc, metric(res, "доказательство в выдаче", "rag"))
+	// Recall — поиском без модели на dev+test (hash-поиск); проверка
+	// сходится со своим числом. Recall по выдаче отвечающего агента на test
+	// — отчётный, с разбором промахов в заметке.
+	rc := find(t, res, "доказательство в топ-5 поиска (dev+test, без модели)", "")
+	if !strings.Contains(rc.Got, "из 27 вопросов; индекс structure, k = 5, поиск dense") || (rc.Status == Pass) != (rc.Got >= "0.80") ||
+		(rc.Status == Fail) != strings.HasPrefix(rc.Note, "мимо топа: ") {
+		t.Fatalf("recall: %+v", rc)
+	}
+	if m := metric(res, "доказательство в топ-k поиска без модели (dev+test)", laneAnsRAG); !strings.HasPrefix(rc.Got, strings.Fields(m)[0]) {
+		t.Fatalf("recall без модели: %q / %q", m, rc.Got)
+	}
+	if metric(res, "доказательство в выдаче отвечающего агента (test, отчётно)", "rag") == "" ||
+		!strings.Contains(strings.Join(res.Notes, "\n"), "Промахи выдачи rag на test (доказательства нет в топ-5, ранг первого релевантного в топ-20): ") {
+		t.Fatalf("recall отвечающего агента: %+v / %v", res.Metrics, res.Notes)
 	}
 	if metric(res, "верно / частично / неверно / «не знаю» (большинство)", "rag") != "8 / 0 / 0 / 2 из 10" ||
-		metric(res, "уверенных ошибок", "norag") != "2" || metric(res, "смен вердикта между повторами (шум)", "rag") != "0 (0 % переходов)" ||
+		metric(res, "уверенных ошибок на отвечаемых", "norag") != "0" ||
+		metric(res, "ответ по существу на вопросах без ответа в базе", "norag") != "2 из 2" ||
+		metric(res, "верно на дискриминативных", "rag") == "" || metric(res, "смен вердикта между повторами (шум)", "rag") != "0 (0 % переходов)" ||
 		metric(res, "согласие правила и судьи", "rag") != "100 % из 20" || !strings.HasPrefix(metric(res, "цена судьи", "судья"), "$") {
 		t.Fatalf("метрики: %+v", res.Metrics)
 	}
@@ -172,10 +189,12 @@ func TestRAGTrialFails(t *testing.T) {
 	if c := find(t, res, "rag верен чаще norag (большинство повторов, test)", ""); c.Status != Fail {
 		t.Fatalf("разница: %+v", c)
 	}
-	if c := find(t, res, "уверенных ошибок у rag", ""); c.Status != Fail || c.Note != "T09, T10" {
+	// Ответ по существу на неотвечаемых — не «уверенная ошибка на
+	// отвечаемых», а провал проверки «не знаю» (нужно 2 из 2).
+	if c := find(t, res, "уверенных ошибок у rag на отвечаемых", ""); c.Status != Pass {
 		t.Fatalf("уверенные ошибки: %+v", c)
 	}
-	if c := find(t, res, "«не знаю» у rag на вопросах без ответа в базе", ""); c.Status != Fail {
+	if c := find(t, res, "«не знаю» у rag на вопросах без ответа в базе", ""); c.Status != Fail || c.Note != "T09 wrong, T10 wrong" {
 		t.Fatalf("«не знаю»: %+v", c)
 	}
 	if res.Verdict() != Fail || len(res.Lanes) != 2 || len(res.Stats) != 0 {

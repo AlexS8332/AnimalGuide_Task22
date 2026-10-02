@@ -51,8 +51,9 @@ const (
 const ToolName = "kb_search"
 
 // Question — вопрос к отвечающему агенту. Context — предыдущие реплики
-// пользователя (вопросы-продолжения): уходят модели как история, а в поиск
-// — склейкой с вопросом (как в kb.Compare).
+// пользователя (вопросы-продолжения): уходят модели в том же сообщении
+// перед вопросом (UserText), а в поиск — склейкой с вопросом (как в
+// kb.Compare).
 type Question struct {
 	Text    string
 	Context []string
@@ -169,12 +170,22 @@ type ModeStats struct {
 	Partial   int  `json:"partial"`
 	Wrong     int  `json:"wrong"`
 	Abstain   int  `json:"abstain"`
-	// ConfidentWrong — неверно и без оговорок (вердикт wrong у отвечаемых и
-	// любой ответ по существу у неотвечаемых).
+	// ConfidentWrong — уверенные ошибки на отвечаемых: вердикт wrong (не
+	// «не знаю» и не частичный ответ).
 	ConfidentWrong int `json:"confident_wrong"`
 	// RightAbstain — «не знаю» на неотвечаемых.
-	RightAbstain int     `json:"right_abstain"`
-	Recall       float64 `json:"recall"`
+	RightAbstain int `json:"right_abstain"`
+	// AnsweredUnanswerable — ответ по существу на неотвечаемом: у norag это
+	// ответ из памяти модели (он может быть и верным — база его просто не
+	// проверяет), у rag — нарушение правила «нет во фрагментах — так и
+	// скажи». Считается отдельно от ConfidentWrong (v22, добавление).
+	AnsweredUnanswerable int `json:"answered_unanswerable"`
+	// Discriminative, DiscriminativeCorrect — вопросов с discriminative=true
+	// (модель без базы их не знает) и верных среди них: разница режимов
+	// здесь — вклад базы, а не общие знания модели (v22, добавление).
+	Discriminative        int     `json:"discriminative"`
+	DiscriminativeCorrect int     `json:"discriminative_correct"`
+	Recall                float64 `json:"recall"`
 	// Agreement — доля прогонов, где правило и судья согласны.
 	Agreement float64 `json:"agreement"`
 	FlipRate  float64 `json:"flip_rate"`

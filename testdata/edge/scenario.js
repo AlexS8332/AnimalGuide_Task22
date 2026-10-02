@@ -1408,6 +1408,21 @@
       await sleep(100);
       assert(window.__xss === undefined, 'исполнился код');
     });
+
+    await check('контрольные вопросы: «Остановить» отменяет идущий прогон', async () => {
+      assert($('kb-qa-stop').hidden, 'кнопка видна без прогона');
+      await kbQaStart(1, false);
+      assert(!$('kb-qa-stop').hidden, 'нет кнопки «Остановить»');
+      const id = $('kb-qa-status').dataset.run;
+      click('#kb-qa-stop');
+      await until('остановлен', () => q(`#kb-qa-status[data-run="${id}"][data-state="cancelled"]`), 8000);
+      const del = factsCalls.filter(x => x.method === 'DELETE' && x.url.endsWith('/api/kb/evals/' + id));
+      assert(del.length === 1, 'DELETE: ' + del.length);
+      assert($('kb-qa-stop').hidden && !$('kb-qa-run').disabled, 'кнопки после остановки');
+      assert(text('#kb-qa-status').includes('остановлен') && text('#kb-qa-status').includes('остановлен по запросу'), 'статус: ' + text('#kb-qa-status'));
+      assert(qa('#kb-qa-table .kb-qa-row .kb-verdict[data-mode="rag"]:not(.pending)').length < 10 && !q('#kb-qa-summary'), 'прогон дошёл до конца');
+      await until('в списке', () => q(`#kb-qa-runs .kb-qa-run[data-run="${id}"][data-state="cancelled"]`), 8000);
+    });
   };
 
   scenarios['shot-kb-docs'] = async () => { await booted(); await openKB(); await sleep(200); };

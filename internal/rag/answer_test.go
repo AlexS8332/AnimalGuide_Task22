@@ -130,8 +130,8 @@ func TestAnswerModes(t *testing.T) {
 	}
 }
 
-// Вопрос-продолжение: предыдущая реплика — отдельным сообщением перед
-// вопросом, а в поиск — вместе с вопросом.
+// Вопрос-продолжение: предыдущая реплика — в том же сообщении перед
+// вопросом (одно сообщение пользователя), а в поиск — вместе с вопросом.
 func TestAnswerContext(t *testing.T) {
 	fake := &llmtest.Fake{Fn: func(req llm.Request) (llm.Response, error) { return llmtest.Text("2,5–5,8 кг."), nil }}
 	// BM25: по слову «харза» из предыдущей реплики, без которой искать нечем.
@@ -145,9 +145,25 @@ func TestAnswerContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := fake.Requests[0].Messages
-	if len(m) != 3 || m[1].Role != llm.RoleUser || m[1].Content != "Где в России водится харза?" ||
-		!strings.HasPrefix(m[2].Content, "А сколько она весит?\n\n") || fake.Requests[0].Model != "m" {
+	want := "Предыдущие реплики пользователя:\n- Где в России водится харза?\n\nВопрос: А сколько она весит?\n\nФрагменты базы знаний"
+	if len(m) != 2 || m[0].Role != llm.RoleSystem || m[1].Role != llm.RoleUser || !strings.HasPrefix(m[1].Content, want) ||
+		ans.User != m[1].Content || fake.Requests[0].Model != "m" {
 		t.Fatalf("сообщения: %+v", m)
+	}
+	if askedText(m[1].Content) != q.Text {
+		t.Fatalf("вопрос в сообщении: %q", askedText(m[1].Content))
+	}
+	// norag: то же одно сообщение без фрагментов; без контекста — сам вопрос.
+	no, err := a.Answer(context.Background(), q, NoRAG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := fake.Requests[1].Messages; len(m) != 2 || no.User != m[1].Content ||
+		m[1].Content != "Предыдущие реплики пользователя:\n- Где в России водится харза?\n\nВопрос: А сколько она весит?" {
+		t.Fatalf("norag: %+v", m)
+	}
+	if (Question{Text: " Вопрос? ", Context: []string{" ", ""}}).UserText() != "Вопрос?" {
+		t.Fatal("пустой контекст")
 	}
 	found := false
 	for _, h := range ans.Hits {
@@ -218,7 +234,7 @@ func TestJudgeGrade(t *testing.T) {
 	}
 	user := got.Messages[1].Content
 	for _, want := range []string{"Вопрос: Сколько видов малых (красных) панд признаёт MDD v2.5?", "Эталон: Два вида рода Ailurus",
-		"- 2 вида | два вида | двух видов", "Числа: 2", "Доказательства:", "(mdd-carnivora)", "<<<\n" + answer + "\n>>>"} {
+		"- 2 вида | два вида | двух видов", "Числа: 2", "Доказательства:", "(mdd-carnivora)", "<<<\nДва вида: A. fulgens и A. styani.\n>>>"} {
 		if !strings.Contains(user, want) {
 			t.Errorf("нет %q во входе судьи:\n%s", want, user)
 		}
@@ -227,7 +243,7 @@ func TestJudgeGrade(t *testing.T) {
 		t.Fatal("системный промпт судьи")
 	}
 	low := strings.ToLower(user + got.Messages[0].Content)
-	for _, leak := range []string{"norag", "режим rag", "без базы", "с базой"} {
+	for _, leak := range []string{"norag", "режим rag", "без базы", "с базой", "structure/"} {
 		if strings.Contains(low, leak) {
 			t.Errorf("судья узнаёт режим: %q", leak)
 		}
@@ -249,5 +265,41 @@ func TestJudgeGrade(t *testing.T) {
 	}
 	if _, err := (&Judge{}).Grade(context.Background(), kb.Question{}, ""); err == nil {
 		t.Fatal("судья без модели")
+	}
+}
+
+// Судья слеп к приметам режима: ссылки [chunk_id] и «в базе знаний» /
+// «во фрагментах» до него не доходят — один и тот же ответ с ними и без
+// них он получает одинаковым текстом.
+func TestJudgeBlind(t *testing.T) {
+	qs := questions(t)
+	var users []string
+	fake := &llmtest.Fake{Fn: func(req llm.Request) (llm.Response, error) {
+		users = append(users, req.Messages[1].Content)
+		return verdictJSON(Correct, "совпало"), nil
+	}}
+	j := &Judge{LLM: fake}
+	q := question(t, qs, "T07")
+	for _, pair := range [][2]string{
+		{"Малая панда ест по 13 часов [red-panda/structure/013].", "Малая панда ест по 13 часов."},
+		{"Малая панда ест по 13 часов [red-panda/structure/013, red-panda/fixed/020].", "Малая панда ест по 13 часов."},
+		{"Во фрагментах этого нет [jungle-cat/structure/001].", "В источниках этого нет."},
+		{"В приведённых фрагментах ничего не сказано; в базе знаний этого нет.", "В источниках ничего не сказано; в источниках этого нет."},
+	} {
+		users = nil
+		for _, a := range pair {
+			if _, err := j.Grade(context.Background(), q, a); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if users[0] != users[1] {
+			t.Errorf("судья различает %q и %q:\n%s\n---\n%s", pair[0], pair[1], users[0], users[1])
+		}
+	}
+	if strings.Contains(JudgeSystem(), "structure/") {
+		t.Fatal("в промпте судьи остались ссылки на фрагменты")
+	}
+	if got := Blind("Около 13 часов red-panda/structure/013."); got != "Около 13 часов ." {
+		t.Fatalf("голая ссылка: %q", got)
 	}
 }

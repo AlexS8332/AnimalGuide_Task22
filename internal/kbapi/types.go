@@ -13,6 +13,7 @@
 //	GET  /api/kb/questions  []kb.Question набора (eval/questions.json)
 //	POST /api/kb/evals      EvalRequest → EvalView (202): прогон контрольных вопросов, асинхронно
 //	GET  /api/kb/evals/{id} EvalView: строки по мере готовности, итог rag.Report
+//	DELETE /api/kb/evals/{id} EvalView: остановить идущий прогон (state cancelled; 409 — уже не идёт)
 //	GET  /api/kb/evals      []EvalView без строк — последние прогоны
 //
 // ask и evals платные (модель): 503, если у приложения нет модели (Answerer
@@ -128,8 +129,9 @@ type AskRequest struct {
 	Q       string     `json:"q"`
 	Context []string   `json:"context,omitempty"`
 	Modes   []rag.Mode `json:"modes,omitempty"`
-	// QuestionID — если вопрос из набора: ответы оцениваются правилом
-	// (и судьёй, если он есть).
+	// QuestionID — если вопрос из набора: ответы оцениваются правилом. Если
+	// Q не совпадает с текстом вопроса набора (с точностью до пробелов), это
+	// другой вопрос — оценки нет, причина — в AskView.Note.
 	QuestionID string `json:"question_id,omitempty"`
 }
 
@@ -139,7 +141,9 @@ type AskView struct {
 	Q       string       `json:"q"`
 	Answers []rag.Answer `json:"answers"`
 	Rows    []rag.Run    `json:"runs,omitempty"`
-	Error   string       `json:"error,omitempty"`
+	// Note — почему ответы не оценены, хотя question_id передан.
+	Note  string `json:"note,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 // EvalRequest — POST evals.
@@ -153,7 +157,7 @@ type EvalRequest struct {
 // EvalView — прогон: состояние, строки по мере готовности, итог.
 type EvalView struct {
 	ID      string      `json:"id"`
-	State   string      `json:"state"` // running | done | failed
+	State   string      `json:"state"` // running | done | failed | cancelled
 	Started string      `json:"started"`
 	Request EvalRequest `json:"request"`
 	Total   int         `json:"total"` // ответов всего (вопросы × режимы × повторы)

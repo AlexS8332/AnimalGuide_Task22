@@ -44,15 +44,18 @@ const (
 
 // Состояния прогона.
 const (
-	StateRunning = "running"
-	StateDone    = "done"
-	StateFailed  = "failed"
+	StateRunning   = "running"
+	StateDone      = "done"
+	StateFailed    = "failed"
+	StateCancelled = "cancelled"
 )
 
 // evalRun — прогон evals. Поля меняются под API.mu.
 type evalRun struct {
 	view EvalView
 	rows map[string]int // id вопроса → индекс в view.Rows
+	// cancel — отмена контекста горутины прогона (DELETE evals/{id}).
+	cancel context.CancelFunc
 }
 
 // method — метод из allowed; иначе 405 с Allow и false.
@@ -215,6 +218,7 @@ func (a *API) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var question *kb.Question
+	note := ""
 	if id := strings.TrimSpace(in.QuestionID); id != "" {
 		qs, ok := a.loadQuestions(w)
 		if !ok {
@@ -232,6 +236,12 @@ func (a *API) ask(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(in.Context) == 0 {
 			in.Context = question.Context
+		}
+		// Текст изменён — это уже другой вопрос: ожидание набора к нему не
+		// относится, и оценка правилом вводила бы в заблуждение.
+		if !sameText(in.Q, question.Q) {
+			note = "вопрос изменён — текст не совпадает с " + question.ID + " набора, поэтому ответы не оцениваются правилом"
+			question = nil
 		}
 	}
 	fn := a.askFn()
@@ -259,7 +269,7 @@ func (a *API) ask(w http.ResponseWriter, r *http.Request) {
 		return // клиент ушёл
 	}
 
-	v := AskView{Q: in.Q, Answers: answers}
+	v := AskView{Q: in.Q, Answers: answers, Note: note}
 	var msgs []string
 	for i, m := range ms {
 		if errs[i] != nil {
@@ -278,6 +288,11 @@ func (a *API) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	server.WriteJSON(w, http.StatusOK, v)
+}
+
+// sameText — тексты совпадают с точностью до пробелов.
+func sameText(a, b string) bool {
+	return strings.Join(strings.Fields(a), " ") == strings.Join(strings.Fields(b), " ")
 }
 
 // recall — нашёлся ли в выдаче фрагмент, покрывающий хотя бы одно
@@ -365,15 +380,18 @@ func (a *API) startEval(w http.ResponseWriter, r *http.Request) {
 	if in.Judge {
 		opts.Judge = a.Judge
 	}
-	run, busy := a.addEval(in, n*len(ms)*in.Repeats)
+	// Контекст — до заведения прогона: отмена (DELETE) должна застать его
+	// уже в прогоне.
+	bg, stop := context.WithTimeout(context.WithoutCancel(r.Context()), evalTimeout)
+	run, busy := a.addEval(in, n*len(ms)*in.Repeats, stop)
 	if run == nil {
+		stop()
 		server.WriteJSON(w, http.StatusConflict, map[string]string{"id": busy,
 			"error": "прогон уже идёт (" + busy + ") — дождитесь его конца: одновременно идёт один прогон"})
 		return
 	}
 	id := run.view.ID
 	opts.Progress = func(row rag.Row) { a.progress(id, row) }
-	bg, stop := context.WithTimeout(context.WithoutCancel(r.Context()), evalTimeout)
 	go func() {
 		defer stop()
 		rep, err := fn(bg, qs, opts)
@@ -383,7 +401,7 @@ func (a *API) startEval(w http.ResponseWriter, r *http.Request) {
 }
 
 // addEval заводит прогон, если ни один не идёт; иначе nil и id идущего.
-func (a *API) addEval(req EvalRequest, total int) (*evalRun, string) {
+func (a *API) addEval(req EvalRequest, total int, cancel context.CancelFunc) (*evalRun, string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, x := range a.evals {
@@ -393,7 +411,7 @@ func (a *API) addEval(req EvalRequest, total int) (*evalRun, string) {
 	}
 	a.seq++
 	run := &evalRun{view: EvalView{ID: "e" + strconv.Itoa(a.seq), State: StateRunning,
-		Started: time.Now().Format(time.RFC3339), Request: req, Total: total}, rows: map[string]int{}}
+		Started: time.Now().Format(time.RFC3339), Request: req, Total: total}, rows: map[string]int{}, cancel: cancel}
 	a.evals = append(a.evals, run)
 	if len(a.evals) > keepEvals {
 		a.evals = append([]*evalRun(nil), a.evals[len(a.evals)-keepEvals:]...)
@@ -467,6 +485,9 @@ func (a *API) finishEval(id string, rep rag.Report, err error) {
 	if run == nil {
 		return
 	}
+	if run.view.State == StateCancelled {
+		return // остановлен: строки — какие успели, состояние не меняется
+	}
 	if err != nil {
 		run.view.State = StateFailed
 		run.view.Error = err.Error()
@@ -512,6 +533,34 @@ func (a *API) getEval(w http.ResponseWriter, id string) {
 		server.WriteError(w, http.StatusNotFound, "нет такого прогона: "+id)
 		return
 	}
+	server.WriteJSON(w, http.StatusOK, v)
+}
+
+// cancelEval — DELETE evals/{id}: отмена идущего прогона. Контекст
+// горутины отменяется, состояние сразу cancelled (новый прогон можно
+// запускать, не дожидаясь, пока текущий запрос к модели вернётся); строки —
+// те, что успели. Закончившийся прогон — 409, неизвестный — 404.
+func (a *API) cancelEval(w http.ResponseWriter, id string) {
+	a.mu.Lock()
+	run := a.findEval(id)
+	if run == nil {
+		a.mu.Unlock()
+		server.WriteError(w, http.StatusNotFound, "нет такого прогона: "+id)
+		return
+	}
+	if run.view.State != StateRunning {
+		state := run.view.State
+		a.mu.Unlock()
+		server.WriteError(w, http.StatusConflict, "прогон "+id+" уже не идёт ("+state+")")
+		return
+	}
+	run.view.State = StateCancelled
+	run.view.Error = "остановлен по запросу: готово " + strconv.Itoa(run.view.Done) + " из " + strconv.Itoa(run.view.Total) + " ответов"
+	if run.cancel != nil {
+		run.cancel()
+	}
+	v := copyView(run, true)
+	a.mu.Unlock()
 	server.WriteJSON(w, http.StatusOK, v)
 }
 
