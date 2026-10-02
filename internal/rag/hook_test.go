@@ -51,8 +51,8 @@ func TestHookBefore(t *testing.T) {
 	if got := strings.Join(tools.Names(tr.Request.Tools), ","); got != "invariant_check,kb_search" {
 		t.Fatalf("инструменты: %s", got)
 	}
-	if !strings.HasPrefix(tr.Request.Rules, "правило другого механизма\n\n") || !strings.Contains(tr.Request.Rules, "[chunk_id]") &&
-		!strings.Contains(tr.Request.Rules, "chunk_id") || !strings.Contains(tr.Request.Rules, "Википедию или GBIF") {
+	if !strings.HasPrefix(tr.Request.Rules, "правило другого механизма\n\n") || !strings.Contains(tr.Request.Rules, "chunk_id") ||
+		!strings.Contains(tr.Request.Rules, "Википедию или GBIF") {
 		t.Fatalf("правило: %q", tr.Request.Rules)
 	}
 	if len(tr.Request.Preload) != 1 || tr.Request.Preload[0].Tool != ToolName ||

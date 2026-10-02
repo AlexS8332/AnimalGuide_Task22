@@ -184,10 +184,10 @@ func TestAnswerErrors(t *testing.T) {
 
 func TestParseVerdict(t *testing.T) {
 	for in, want := range map[string]Verdict{
-		`{"verdict":"correct","reason":"всё на месте"}`:                       Correct,
+		`{"verdict":"correct","reason":"всё на месте"}`:                        Correct,
 		"```json\n{\"verdict\": \"partial\", \"reason\": \"нет тиража\"}\n```": Partial,
 		"Оценка {см. ниже}:\n{\"verdict\":\"WRONG\",\"reason\":\"x\"} — так.":  Wrong,
-		`  {"reason":"нет данных","verdict":" abstain "}`:                     Abstain,
+		`  {"reason":"нет данных","verdict":" abstain "}`:                      Abstain,
 	} {
 		v, reason, err := ParseVerdict(in)
 		if err != nil || v != want || reason == "" {
