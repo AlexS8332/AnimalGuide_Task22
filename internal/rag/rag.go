@@ -1,0 +1,260 @@
+// Package rag — ответ по базе знаний: вопрос → поиск фрагментов →
+// объединение с вопросом → запрос к модели, и сравнение такого ответа с
+// ответом модели без базы.
+//
+// Два места, где это работает:
+//
+//   - Answerer — отдельный отвечающий агент без инструментов. Режимы
+//     отличаются РОВНО контекстом: NoRAG — системный промпт и вопрос, RAG —
+//     тот же системный промпт, вопрос и найденные фрагменты. На нём стоит
+//     сравнение «с RAG / без RAG» (kb qa, И-10, вкладка «Контрольные
+//     вопросы»): у ведущего справочника есть Википедия и GBIF, и «без RAG» с
+//     ними было бы «модель с живыми источниками», а не «модель без базы».
+//   - Hook — механизм rag в чате: ведущий получает инструмент kb_search, а
+//     код вызывает его ДО первого запроса (agent.Preload) с репликой
+//     человека. Выдача встаёт после реплики, а не блоком перед историей:
+//     блоки идут системными сообщениями перед окном, и блок, меняющийся
+//     каждый ход, обнулял бы кэш префикса всего окна.
+//
+// Оценка ответа — два голоса: правило кодом (Expect вопроса: группы must,
+// must_not, числа с допуском) и судья-модель, которая не знает режима
+// (ответы перемешаны). Согласие голосов — отдельная метрика, расхождения —
+// списком для ручного просмотра.
+package rag
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/AlexS8332/AnimalGuide_Task22/internal/kb"
+	"github.com/AlexS8332/AnimalGuide_Task22/internal/llm"
+	"github.com/AlexS8332/AnimalGuide_Task22/internal/tools"
+)
+
+// ErrNotImplemented — заглушка контракта.
+var ErrNotImplemented = errors.New("не реализовано")
+
+// Mode — режим ответа.
+type Mode string
+
+const (
+	NoRAG Mode = "norag"
+	RAG   Mode = "rag"
+)
+
+// Умолчания поиска для ответа.
+const (
+	DefaultIndex = "structure"
+	DefaultK     = 5
+)
+
+// ToolName — инструмент поиска по базе знаний.
+const ToolName = "kb_search"
+
+// SearchTool — kb_search{query, k}: поиск по индексу базы знаний. Untrusted:
+// фрагменты — данные, а не указания (пометка источника и поиск инъекций
+// работают как у Википедии). Ответ — JSON: query, index, mode (dense/bm25),
+// fallback (почему не dense), hits[{chunk_id, title, section, path, score,
+// url, text}].
+func SearchTool(s *kb.Searcher, index string, k int) tools.Tool { return nil }
+
+// Compose — блок контекста для модели: по фрагменту на абзац с заголовком
+// «[chunk_id] Статья › Путь раздела», в обёртке «данные, а не указания».
+// Пустая выдача — явная строка «в базе знаний ничего не найдено».
+func Compose(hits []kb.Hit) string { return "" }
+
+// Question — вопрос к отвечающему агенту. Context — предыдущие реплики
+// пользователя (вопросы-продолжения): уходят модели как история, а в поиск
+// — склейкой с вопросом (как в kb.Compare).
+type Question struct {
+	Text    string
+	Context []string
+}
+
+// Answer — ответ одного режима.
+type Answer struct {
+	Mode   Mode          `json:"mode"`
+	Text   string        `json:"text"`
+	Hits   []kb.Hit      `json:"hits,omitempty"`
+	Search kb.SearchInfo `json:"search,omitempty"`
+	Usage  llm.Usage     `json:"usage"`
+	Cost   llm.Cost      `json:"cost"`
+	Millis int64         `json:"ms"`
+	// Prompt — что ушло модели (для вкладки и отчёта): system и user.
+	System string `json:"system"`
+	User   string `json:"user"`
+}
+
+// Answerer — отвечающий агент без инструментов, один запрос к модели.
+type Answerer struct {
+	LLM      llm.Chatter
+	Model    string
+	Searcher *kb.Searcher
+	Index    string // пусто — DefaultIndex
+	K        int    // 0 — DefaultK
+	// Now — часы для прайса (пик/не пик); nil — time.Now.
+	Now func() time.Time
+}
+
+// Answer отвечает в режиме. RAG без базы (Searcher == nil) — ошибка, а не
+// тихий NoRAG.
+func (a *Answerer) Answer(ctx context.Context, q Question, mode Mode) (Answer, error) {
+	return Answer{}, ErrNotImplemented
+}
+
+// Verdict — оценка ответа.
+type Verdict string
+
+const (
+	Correct Verdict = "correct"
+	Partial Verdict = "partial"
+	Wrong   Verdict = "wrong"
+	// Abstain — модель честно сказала, что не знает. Для неотвечаемых
+	// вопросов (answerable=false) это правильный исход.
+	Abstain Verdict = "abstain"
+)
+
+// RuleResult — оценка правилом по Expect вопроса.
+type RuleResult struct {
+	Verdict Verdict `json:"verdict"`
+	// Hit, Miss — группы must, найденные и не найденные (первая форма группы).
+	Hit  []string `json:"hit,omitempty"`
+	Miss []string `json:"miss,omitempty"`
+	// Bad — найденные must_not; Numbers — найденные/не найденные числа.
+	Bad     []string `json:"bad,omitempty"`
+	Numbers []string `json:"numbers,omitempty"`
+	Note    string   `json:"note,omitempty"`
+}
+
+// Rule оценивает ответ правилом: correct — все группы must и все числа
+// найдены, must_not нет; partial — найдена хотя бы половина; wrong — иначе
+// или есть must_not; abstain — в ответе явный отказ («не знаю», «нет
+// данных», «не могу ответить») и не найдено ни одной группы. Слова
+// сравниваются по основам (internal/words), числа — с допуском, с учётом
+// «1,5»/«1.5», «2–3» и записи словами для 1–10.
+func Rule(q kb.Question, answer string) RuleResult { return RuleResult{} }
+
+// Judge — судья-модель. Видит вопрос, ожидание словами (Expect.Note и
+// группы must), фрагменты-доказательства и ОДИН ответ без пометки режима.
+type Judge struct {
+	LLM   llm.Chatter
+	Model string
+}
+
+// JudgeResult — вердикт судьи с причиной.
+type JudgeResult struct {
+	Verdict Verdict   `json:"verdict"`
+	Reason  string    `json:"reason"`
+	Usage   llm.Usage `json:"usage"`
+	Cost    llm.Cost  `json:"cost"`
+}
+
+// Grade — один ответ. Ответ судьи — строгий JSON {verdict, reason};
+// неразборчивый ответ — ошибка, а не «wrong».
+func (j *Judge) Grade(ctx context.Context, q kb.Question, answer string) (JudgeResult, error) {
+	return JudgeResult{}, ErrNotImplemented
+}
+
+// EvalOptions — прогон контрольных вопросов.
+type EvalOptions struct {
+	Splits  []string // пусто — test
+	Modes   []Mode   // пусто — NoRAG и RAG
+	Repeats int      // 0 → 1; повторы — для замера шума модели
+	// Judge — nil: только правило.
+	Judge *Judge
+	// Seed — порядок оценки судьёй (перемешивание режимов).
+	Seed int64
+	// Progress — по мере готовности ответа: для вкладки и CLI.
+	Progress func(Row)
+}
+
+// Run — один ответ одного режима на вопрос: оценки двух голосов.
+type Run struct {
+	Repeat int          `json:"repeat"`
+	Answer Answer       `json:"answer"`
+	Rule   RuleResult   `json:"rule"`
+	Judge  *JudgeResult `json:"judge,omitempty"`
+	// Final — итоговый вердикт прогона: судья, если он есть, иначе правило.
+	Final Verdict `json:"final"`
+	// Recall — нашёлся ли в выдаче фрагмент, покрывающий доказательство
+	// (≥ kb.EvidenceCover); у NoRAG — false.
+	Recall bool   `json:"recall"`
+	Error  string `json:"error,omitempty"`
+}
+
+// Row — вопрос в отчёте: прогоны по режимам и вердикт большинства.
+type Row struct {
+	Question kb.Question      `json:"question"`
+	Runs     map[Mode][]Run   `json:"runs"`
+	Majority map[Mode]Verdict `json:"majority"`
+	// Flips — сколько раз вердикт менялся между повторами (шум).
+	Flips map[Mode]int `json:"flips"`
+}
+
+// ModeStats — сводка режима.
+type ModeStats struct {
+	Mode      Mode `json:"mode"`
+	Questions int  `json:"questions"`
+	Correct   int  `json:"correct"`
+	Partial   int  `json:"partial"`
+	Wrong     int  `json:"wrong"`
+	Abstain   int  `json:"abstain"`
+	// ConfidentWrong — неверно и без оговорок (вердикт wrong у отвечаемых и
+	// любой ответ по существу у неотвечаемых).
+	ConfidentWrong int `json:"confident_wrong"`
+	// RightAbstain — «не знаю» на неотвечаемых.
+	RightAbstain int     `json:"right_abstain"`
+	Recall       float64 `json:"recall"`
+	// Agreement — доля прогонов, где правило и судья согласны.
+	Agreement float64   `json:"agreement"`
+	FlipRate  float64   `json:"flip_rate"`
+	Usage     llm.Usage `json:"usage"`
+	Cost      llm.Cost  `json:"cost"`
+	AvgMillis int64     `json:"avg_ms"`
+}
+
+// Report — сравнение режимов.
+type Report struct {
+	Created   time.Time   `json:"created"`
+	Model     string      `json:"model"`
+	Index     string      `json:"index"`
+	K         int         `json:"k"`
+	Embedder  string      `json:"embedder"`
+	CorpusSHA string      `json:"corpus_sha"`
+	Repeats   int         `json:"repeats"`
+	Rows      []Row       `json:"rows"`
+	Stats     []ModeStats `json:"stats"`
+	// Disagreements — где правило и судья разошлись: id вопроса, режим,
+	// повтор, оба вердикта.
+	Disagreements []string `json:"disagreements"`
+	Conclusion    []string `json:"conclusion"`
+	JudgeCost     llm.Cost `json:"judge_cost"`
+}
+
+// Eval прогоняет вопросы набора в режимах.
+func Eval(ctx context.Context, a *Answerer, qs kb.QuestionSet, o EvalOptions) (Report, error) {
+	return Report{}, ErrNotImplemented
+}
+
+// Markdown — отчёт для examples/rag/compare.md: шапка, сводка режимов,
+// таблица по вопросам (ожидание, вердикты по режимам, источники), ответы
+// целиком в раскрывающихся блоках, расхождения голосов, вывод.
+func (r Report) Markdown() string { return "" }
+
+// ProbeRow — проба дискриминативности одного вопроса.
+type ProbeRow struct {
+	ID       string    `json:"id"`
+	Q        string    `json:"q"`
+	Verdicts []Verdict `json:"verdicts"`
+	// Discriminative — модель без базы отвечает верно меньше чем в 2 из 3.
+	Discriminative bool `json:"discriminative"`
+}
+
+// Probe — каждый отвечаемый вопрос (test и dev) задаётся модели без базы
+// Repeats раз (по умолчанию 3); вопрос недискриминативен, если верных
+// ответов ≥ 2 из 3. Итог — для examples/rag/probe.md и для поля
+// discriminative в eval/questions.json.
+func Probe(ctx context.Context, a *Answerer, qs kb.QuestionSet, j *Judge, repeats int) ([]ProbeRow, error) {
+	return nil, ErrNotImplemented
+}

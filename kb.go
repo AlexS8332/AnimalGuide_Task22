@@ -98,3 +98,15 @@ func kbLine(a *kbapi.API) string {
 	}
 	return line + "; эмбеддер не отвечает — поиск по BM25"
 }
+
+// kbQuestionsFile — контрольные вопросы базы знаний по умолчанию.
+const kbQuestionsFile = "eval/questions.json"
+
+// kbQuestions — путь к контрольным вопросам: KB_QUESTIONS, иначе
+// eval/questions.json от рабочего каталога (вопросы лежат в репозитории).
+func (o options) kbQuestions() string {
+	if v := strings.TrimSpace(os.Getenv("KB_QUESTIONS")); v != "" {
+		return v
+	}
+	return kbQuestionsFile
+}

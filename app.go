@@ -23,6 +23,7 @@ import (
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/memory"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/persona"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/profile"
+	"github.com/AlexS8332/AnimalGuide_Task22/internal/rag"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/runs"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/store"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/tools"
@@ -98,6 +99,18 @@ func wire(o options, registry *features.Registry, defaults features.Set, runner 
 	// обращении, так что сборка (и стенд, где механизм выключен) демон не
 	// трогает.
 	trivia := &feed.Hook{Remote: feed.NewRemote(o.facts(), os.Getenv("MCP_TOKEN"), nil)}
+	// База знаний открывается до менеджера ходов: её поиск нужен механизму
+	// rag. Базы нет — хук откатывает механизм с причиной в журнале.
+	know := openKB(o, dataDir)
+	retrieval := &rag.Hook{Searcher: know.api.Searcher, Why: know.api.Why}
+	// Отвечающий агент и судья окна «База знаний» — та же модель, без
+	// инструментов: сравнение «с базой / без базы» идёт на них, а не на
+	// ведущем с живыми источниками.
+	if know.api.Searcher != nil {
+		know.api.Answerer = &rag.Answerer{LLM: runner.LLM, Model: runner.Model, Searcher: know.api.Searcher}
+		know.api.Judge = &rag.Judge{LLM: runner.LLM, Model: runner.Model}
+	}
+	know.api.Questions = o.kbQuestions()
 	manager := runs.NewManager(runs.Config{
 		Agents:   deps,
 		Store:    history.NewStore(data),
@@ -109,13 +122,12 @@ func wire(o options, registry *features.Registry, defaults features.Set, runner 
 		// Факты последними: ведущий и составитель читают инструменты хода
 		// уже после всех хуков, так что место на выдачу не влияет, а в
 		// журнале заметка о демоне встаёт после событий памяти и профиля.
-		Hooks: []runs.Hook{compile, guide, people, trivia},
+		Hooks: []runs.Hook{compile, guide, people, trivia, retrieval},
 	})
 	servers, err := openHub(o, dataDir, runner)
 	if err != nil {
 		return app{}, err
 	}
-	know := openKB(o, dataDir)
 	return app{Manager: manager, People: people, Compile: compile, Guide: guide, Local: local, Fetcher: fetcher,
 		Sources: sources, Feed: trivia,
 		Pipes: &feed.Pipelines{Remote: trivia.Remote, LLM: runner.LLM, Model: runner.Model},

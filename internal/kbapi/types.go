@@ -7,6 +7,17 @@
 //	GET /api/kb/search?q=&index=&k=&mode= SearchView (index пусто — оба индекса рядом)
 //	GET /api/kb/report                    kb.Report (404 — отчёта ещё нет)
 //
+// v22 — ответ по базе и сравнение с ответом без базы:
+//
+//	POST /api/kb/ask        AskRequest → AskView: один вопрос в режимах norag и rag рядом
+//	GET  /api/kb/questions  []kb.Question набора (eval/questions.json)
+//	POST /api/kb/evals      EvalRequest → EvalView (202): прогон контрольных вопросов, асинхронно
+//	GET  /api/kb/evals/{id} EvalView: строки по мере готовности, итог rag.Report
+//	GET  /api/kb/evals      []EvalView без строк — последние прогоны
+//
+// ask и evals платные (модель): 503, если у приложения нет модели (Answerer
+// == nil); 409 — прогон уже идёт (в теле id идущего), одновременно один.
+//
 // Коды: 400 — неверный запрос; 404 — нет документа, индекса или отчёта;
 // 405 — не тот метод; 503 — базы нет (в теле why и hint: как её собрать).
 // Всё, что пришло из корпуса, интерфейс выводит как данные (esc), а не
@@ -19,6 +30,7 @@ import (
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/corpus"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/embed"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/kb"
+	"github.com/AlexS8332/AnimalGuide_Task22/internal/rag"
 	"github.com/AlexS8332/AnimalGuide_Task22/internal/server"
 )
 
@@ -37,6 +49,12 @@ type API struct {
 	Embedder *embed.HTTP
 	Path     string // путь к kb.db, для подсказок
 	Why      string
+	// Answerer — отвечающий агент (v22); nil — ask и evals выключены.
+	Answerer *rag.Answerer
+	// Judge — судья прогона; nil — оценка только правилом.
+	Judge *rag.Judge
+	// Questions — путь к eval/questions.json.
+	Questions string
 }
 
 // InfoView — GET info.
@@ -78,4 +96,44 @@ type SearchResult struct {
 // Extension — раздел для server.New.
 func (a *API) Extension() []server.Extension {
 	return []server.Extension{{Prefix: Prefix, Handler: http.HandlerFunc(a.handle)}}
+}
+
+// AskRequest — POST ask. Modes пусто — оба режима.
+type AskRequest struct {
+	Q       string     `json:"q"`
+	Context []string   `json:"context,omitempty"`
+	Modes   []rag.Mode `json:"modes,omitempty"`
+	// QuestionID — если вопрос из набора: ответы оцениваются правилом
+	// (и судьёй, если он есть).
+	QuestionID string `json:"question_id,omitempty"`
+}
+
+// AskView — ответы режимов рядом (в порядке Modes) и оценки, если вопрос из
+// набора.
+type AskView struct {
+	Q       string       `json:"q"`
+	Answers []rag.Answer `json:"answers"`
+	Rows    []rag.Run    `json:"runs,omitempty"`
+	Error   string       `json:"error,omitempty"`
+}
+
+// EvalRequest — POST evals.
+type EvalRequest struct {
+	Splits  []string   `json:"splits,omitempty"` // пусто — test
+	Modes   []rag.Mode `json:"modes,omitempty"`
+	Repeats int        `json:"repeats,omitempty"` // 0 → 1, предел 3
+	Judge   bool       `json:"judge"`
+}
+
+// EvalView — прогон: состояние, строки по мере готовности, итог.
+type EvalView struct {
+	ID      string      `json:"id"`
+	State   string      `json:"state"` // running | done | failed
+	Started string      `json:"started"`
+	Request EvalRequest `json:"request"`
+	Total   int         `json:"total"` // ответов всего (вопросы × режимы × повторы)
+	Done    int         `json:"done"`
+	Rows    []rag.Row   `json:"rows,omitempty"`
+	Report  *rag.Report `json:"report,omitempty"`
+	Error   string      `json:"error,omitempty"`
 }

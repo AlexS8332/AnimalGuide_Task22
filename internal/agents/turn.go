@@ -63,6 +63,11 @@ type Request struct {
 	// Rules — абзац системного промпта от выключенных механизмов: то, что
 	// должно было уйти блоком, уходит словами (ФТ-48).
 	Rules string `json:"-"`
+	// Preload — вызовы инструментов кодом до первого запроса ведущего
+	// (agent.Prepared.Preload): выдача встаёт после реплики человека, а не
+	// блоком перед историей. Инструмент вызова должен быть в Tools, иначе
+	// Runner пропустит вызов с заметкой в журнале.
+	Preload []agent.Preload `json:"-"`
 }
 
 // System — системный промпт агента с абзацем правил хода.
@@ -426,7 +431,7 @@ func (t *turn) lead(ctx context.Context, req Request) (agent.Reply, error) {
 	list = append(list, req.Tools...)
 	spec := agent.Spec{Name: "lead", System: req.System(leadSystem), Tools: list, MaxSteps: leadMaxSteps}
 	blocks := withCards(t.d.Features, req.Blocks, t.state(), t.fs)
-	reply, err := t.d.Runner.Run(ctx, spec, agent.Prepared{Blocks: blocks, History: req.Window, User: req.Text, Features: t.fs}, t.em)
+	reply, err := t.d.Runner.Run(ctx, spec, agent.Prepared{Blocks: blocks, History: req.Window, User: req.Text, Features: t.fs, Preload: req.Preload}, t.em)
 	t.add(reply.Stats)
 	return reply, err
 }
